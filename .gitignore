@@ -1,0 +1,28 @@
+# Unreal Engine generated data
+Binaries/
+DerivedDataCache/
+Intermediate/
+Saved/
+
+# IDE and platform-specific files
+.DS_Store
+.idea/
+.vs/
+*.VC.db
+*.VC.opendb
+
+# Build artifacts and logs
+*.log
+*.tmp
+*.suo
+*.xcodeproj/*
+*.xcworkspace/*
+!*.xcworkspace/contents.xcworkspacedata
+!*.xcworkspace/xcshareddata/
+!*.xcworkspace/xcshareddata/**
+
+# User-specific project files
+*.opensdf
+*.sdf
+*.user
+*.userprefs
