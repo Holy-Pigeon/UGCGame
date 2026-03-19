@@ -15,6 +15,7 @@ Saved/
 *.log
 *.tmp
 *.suo
+*.PackageVersionCounter
 *.xcodeproj/*
 *.xcworkspace/*
 !*.xcworkspace/contents.xcworkspacedata
