@@ -8,7 +8,22 @@ public class UGCGame : ModuleRules
 	{
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
 	
-		PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "InputCore", "EnhancedInput" });
+		PublicDependencyModuleNames.AddRange(new string[]
+		{
+			"Core",
+			"CoreUObject",
+			"DeveloperSettings",
+			"Engine",
+			"EnhancedInput",
+			"HTTP",
+			"InputCore",
+			"JsEnv",
+			"Json",
+			"JsonUtilities",
+			"Slate",
+			"SlateCore",
+			"UMG"
+		});
 
 		PrivateDependencyModuleNames.AddRange(new string[] {  });
 

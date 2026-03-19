@@ -19,6 +19,10 @@
 			]
 		},
 		{
+			"Name": "Puerts",
+			"Enabled": true
+		},
+		{
 			"Name": "UnrealMCP",
 			"Enabled": true
 		}
