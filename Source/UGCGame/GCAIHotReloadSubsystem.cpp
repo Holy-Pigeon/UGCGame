@@ -1,7 +1,10 @@
 #include "GCAIHotReloadSubsystem.h"
 
 #include "GCAIHotReloadSettings.h"
+#include "GCAIHotReloadChatWidget.h"
 #include "GCAIHotfixBridge.h"
+#include "Blueprint/UserWidget.h"
+#include "Engine/World.h"
 #include "HttpModule.h"
 #include "HAL/PlatformProcess.h"
 #include "Interfaces/IHttpResponse.h"
@@ -13,17 +16,60 @@
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
 #include "TimerManager.h"
+#include "Engine/Engine.h"
 
 namespace
 {
 const FString DefaultModulePrefix = TEXT("AIHotfix/Generated");
 const FString DefaultCopilotApiBaseUrl = TEXT("https://api.individual.githubcopilot.com");
+const FString DefaultCopilotModel = TEXT("gpt-5.2");
 const FString CopilotTokenUrl = TEXT("https://api.github.com/copilot_internal/v2/token");
 const FString GitHubDeviceCodeUrl = TEXT("https://github.com/login/device/code");
 const FString GitHubDeviceAccessTokenUrl = TEXT("https://github.com/login/oauth/access_token");
 const FString GitHubOAuthClientId = TEXT("01ab8ac9400c4e429b23");
 const FString GitHubDeviceCodeScope = TEXT("read:user");
+const FString CopilotEditorVersion = TEXT("vscode/1.96.2");
+const FString CopilotUserAgent = TEXT("GitHubCopilotChat/0.26.7");
+const FString CopilotApiVersion = TEXT("2025-04-01");
 constexpr int32 MaxChatMessagesToSend = 12;
+
+bool IsCopilotResponsesModelSupported(const FString& Model)
+{
+	return Model.Equals(TEXT("gpt-5.2"), ESearchCase::IgnoreCase);
+}
+
+FString NormalizeCopilotModel(const FString& Model)
+{
+	const FString TrimmedModel = Model.TrimStartAndEnd();
+	return IsCopilotResponsesModelSupported(TrimmedModel) ? TrimmedModel : DefaultCopilotModel;
+}
+
+FString NormalizeRequestPath(const FString& Path, const FString& FallbackPath)
+{
+	FString NormalizedPath = Path.TrimStartAndEnd();
+	if (NormalizedPath.IsEmpty())
+	{
+		NormalizedPath = FallbackPath;
+	}
+
+	if (!NormalizedPath.StartsWith(TEXT("/")))
+	{
+		NormalizedPath = TEXT("/") + NormalizedPath;
+	}
+
+	return NormalizedPath;
+}
+
+FString BuildRequestUrl(const FString& BaseUrl, const FString& Path)
+{
+	FString NormalizedBaseUrl = BaseUrl.TrimStartAndEnd();
+	while (NormalizedBaseUrl.EndsWith(TEXT("/")))
+	{
+		NormalizedBaseUrl.LeftChopInline(1, EAllowShrinking::No);
+	}
+
+	return NormalizedBaseUrl + NormalizeRequestPath(Path, TEXT("/v1/responses"));
+}
 }
 
 void UGCAIHotReloadSubsystem::Initialize(FSubsystemCollectionBase& Collection)
@@ -32,13 +78,22 @@ void UGCAIHotReloadSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 
 	const UGCAIHotReloadSettings* Settings = GetDefault<UGCAIHotReloadSettings>();
 	ProviderConfig = Settings->DefaultProvider;
+	LoadProviderConfigCache();
 
 	Bridge = NewObject<UGCAIHotfixBridge>(this);
 	Bridge->Initialize(this);
+
+	WorldBeginPlayHandle = FWorldDelegates::OnPostWorldInitialization.AddUObject(this, &UGCAIHotReloadSubsystem::HandleWorldPostInitialization);
 }
 
 void UGCAIHotReloadSubsystem::Deinitialize()
 {
+	if (WorldBeginPlayHandle.IsValid())
+	{
+		FWorldDelegates::OnPostWorldInitialization.Remove(WorldBeginPlayHandle);
+		WorldBeginPlayHandle.Reset();
+	}
+
 	if (PendingGenerationRequest.IsValid())
 	{
 		PendingGenerationRequest->OnProcessRequestComplete().Unbind();
@@ -62,9 +117,75 @@ void UGCAIHotReloadSubsystem::Deinitialize()
 	Super::Deinitialize();
 }
 
+void UGCAIHotReloadSubsystem::HandleWorldPostInitialization(UWorld* InWorld, const UWorld::InitializationValues IVS)
+{
+	(void)IVS;
+	TryShowChatWidget(InWorld);
+}
+
+void UGCAIHotReloadSubsystem::TryShowChatWidget(UWorld* InWorld)
+{
+	if (!InWorld)
+	{
+		return;
+	}
+
+	if (InWorld->WorldType != EWorldType::PIE && InWorld->WorldType != EWorldType::Game)
+	{
+		return;
+	}
+
+	const FString CleanMapName = UWorld::RemovePIEPrefix(InWorld->GetMapName());
+	if (!CleanMapName.EndsWith(TEXT("MainScene")))
+	{
+		return;
+	}
+
+	if (RuntimeChatWidget)
+	{
+		return;
+	}
+
+	APlayerController* PlayerController = InWorld->GetFirstPlayerController();
+	if (!PlayerController)
+	{
+		FTimerDelegate RetryDelegate;
+		RetryDelegate.BindUObject(this, &UGCAIHotReloadSubsystem::TryShowChatWidget, InWorld);
+		InWorld->GetTimerManager().SetTimerForNextTick(RetryDelegate);
+		return;
+	}
+
+	PlayerController->bShowMouseCursor = true;
+	PlayerController->SetInputMode(FInputModeGameAndUI());
+
+	RuntimeChatWidget = CreateWidget<UGCAIHotReloadChatWidget>(PlayerController, UGCAIHotReloadChatWidget::StaticClass());
+	if (RuntimeChatWidget)
+	{
+		RuntimeChatWidget->AddToViewport(1000);
+		EmitRuntimeLog(TEXT("AI hotfix chat widget attached to MainScene."));
+		if (GEngine)
+		{
+			GEngine->AddOnScreenDebugMessage(-1, 8.0f, FColor::Green, TEXT("AI hotfix chat widget attached."));
+		}
+	}
+	else
+	{
+		FTimerDelegate RetryDelegate;
+		RetryDelegate.BindUObject(this, &UGCAIHotReloadSubsystem::TryShowChatWidget, InWorld);
+		InWorld->GetTimerManager().SetTimerForNextTick(RetryDelegate);
+	}
+}
+
 void UGCAIHotReloadSubsystem::ConfigureProvider(const FGCAIProviderConfig& InProviderConfig)
 {
 	ProviderConfig = InProviderConfig;
+	if (ProviderConfig.Transport == EGCAIProviderTransport::GitHubCopilot)
+	{
+		ProviderConfig.BaseUrl = DefaultCopilotApiBaseUrl;
+		ProviderConfig.ChatCompletionsPath = TEXT("/v1/responses");
+		ProviderConfig.Model = NormalizeCopilotModel(ProviderConfig.Model);
+	}
+	SaveProviderConfigCache();
 }
 
 FGCAIProviderConfig UGCAIHotReloadSubsystem::GetProviderConfig() const
@@ -181,6 +302,7 @@ void UGCAIHotReloadSubsystem::BeginCopilotDeviceLogin()
 	CopilotDeviceAuthState = FGCAICopilotDeviceAuthState();
 	CopilotDeviceAuthState.bIsPending = true;
 	CopilotDeviceAuthState.StatusMessage = TEXT("Requesting GitHub device code...");
+	EmitRuntimeLog(TEXT("Requesting GitHub device code."));
 	BroadcastCopilotDeviceAuthUpdated();
 
 	TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Request = FHttpModule::Get().CreateRequest();
@@ -307,6 +429,63 @@ void UGCAIHotReloadSubsystem::ScheduleCopilotDeviceTokenPoll(float DelaySeconds)
 			DelaySeconds,
 			false);
 	}
+}
+
+void UGCAIHotReloadSubsystem::LoadProviderConfigCache()
+{
+	const FString CachePath = GetProviderConfigCachePath();
+	FString CacheJson;
+	if (!FFileHelper::LoadFileToString(CacheJson, *CachePath))
+	{
+		return;
+	}
+
+	TSharedPtr<FJsonObject> Root;
+	const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(CacheJson);
+	if (!FJsonSerializer::Deserialize(Reader, Root) || !Root.IsValid())
+	{
+		return;
+	}
+
+	FString CachedApiKey;
+	if (Root->TryGetStringField(TEXT("api_key"), CachedApiKey) && !CachedApiKey.IsEmpty())
+	{
+		ProviderConfig.ApiKey = CachedApiKey;
+		CopilotDeviceAuthState.bIsAuthenticated = true;
+		CopilotDeviceAuthState.StatusMessage = TEXT("Loaded cached GitHub session.");
+	}
+
+	FString CachedModel;
+	if (Root->TryGetStringField(TEXT("model"), CachedModel) && !CachedModel.IsEmpty())
+	{
+		ProviderConfig.Model = ProviderConfig.Transport == EGCAIProviderTransport::GitHubCopilot
+			? NormalizeCopilotModel(CachedModel)
+			: CachedModel;
+	}
+}
+
+void UGCAIHotReloadSubsystem::SaveProviderConfigCache() const
+{
+	const FString CachePath = GetProviderConfigCachePath();
+	IFileManager::Get().MakeDirectory(*FPaths::GetPath(CachePath), true);
+
+	TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("provider_id"), ProviderConfig.ProviderId);
+	Root->SetStringField(TEXT("api_key"), ProviderConfig.ApiKey);
+	Root->SetStringField(TEXT("model"), ProviderConfig.Model);
+
+	FString CacheJson;
+	const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&CacheJson);
+	FJsonSerializer::Serialize(Root, Writer);
+	FFileHelper::SaveStringToFile(CacheJson, *CachePath);
+}
+
+FString UGCAIHotReloadSubsystem::GetProviderConfigCachePath() const
+{
+	const FString RelativePath = ProviderConfig.ApiTokenCachePath.IsEmpty()
+		? TEXT("Saved/AI/github-copilot.token.json")
+		: ProviderConfig.ApiTokenCachePath;
+	return FPaths::ConvertRelativePathToFull(FPaths::ProjectDir(), RelativePath);
 }
 
 void UGCAIHotReloadSubsystem::ResetCopilotDeviceLogin(bool bKeepAuthenticatedState)
@@ -437,37 +616,58 @@ void UGCAIHotReloadSubsystem::BeginGenerateRequest(
 	const FString& AuthToken)
 {
 	TSharedRef<FJsonObject> RootObject = MakeShared<FJsonObject>();
-	RootObject->SetStringField(TEXT("model"), ProviderConfig.Model);
-	RootObject->SetNumberField(TEXT("temperature"), ProviderConfig.Temperature);
+	const FString RequestModel = ProviderConfig.Transport == EGCAIProviderTransport::GitHubCopilot
+		? NormalizeCopilotModel(ProviderConfig.Model)
+		: ProviderConfig.Model;
+	RootObject->SetStringField(TEXT("model"), RequestModel);
 
+	const bool bUseResponsesApi = ProviderConfig.Transport == EGCAIProviderTransport::GitHubCopilot;
+	if (!bUseResponsesApi)
+	{
+		RootObject->SetNumberField(TEXT("temperature"), ProviderConfig.Temperature);
+	}
 	TArray<TSharedPtr<FJsonValue>> Messages;
 
-	TSharedRef<FJsonObject> SystemMessage = MakeShared<FJsonObject>();
-	SystemMessage->SetStringField(TEXT("role"), TEXT("system"));
-	SystemMessage->SetStringField(TEXT("content"), BuildSystemPrompt());
-	Messages.Add(MakeShared<FJsonValueObject>(SystemMessage));
+	auto AddMessage = [&Messages, bUseResponsesApi](const FString& Role, const FString& Content)
+	{
+		TSharedRef<FJsonObject> Message = MakeShared<FJsonObject>();
+		if (bUseResponsesApi)
+		{
+			Message->SetStringField(TEXT("role"), Role);
 
-	TSharedRef<FJsonObject> ModuleContextMessage = MakeShared<FJsonObject>();
-	ModuleContextMessage->SetStringField(TEXT("role"), TEXT("system"));
-	ModuleContextMessage->SetStringField(
-		TEXT("content"),
+			TArray<TSharedPtr<FJsonValue>> ContentParts;
+			TSharedRef<FJsonObject> ContentPart = MakeShared<FJsonObject>();
+			const bool bIsAssistantRole = Role.Equals(TEXT("assistant"), ESearchCase::IgnoreCase);
+			ContentPart->SetStringField(TEXT("type"), bIsAssistantRole ? TEXT("output_text") : TEXT("input_text"));
+			ContentPart->SetStringField(TEXT("text"), Content);
+			ContentParts.Add(MakeShared<FJsonValueObject>(ContentPart));
+			Message->SetArrayField(TEXT("content"), ContentParts);
+		}
+		else
+		{
+			Message->SetStringField(TEXT("role"), Role);
+			Message->SetStringField(TEXT("content"), Content);
+		}
+
+ 		Messages.Add(MakeShared<FJsonValueObject>(Message));
+	};
+
+	AddMessage(TEXT("system"), BuildSystemPrompt());
+	AddMessage(
+		TEXT("system"),
 		FString::Printf(
 			TEXT("Target module for this conversation: %s.\nLatest user request: %s\nReturn JSON only. Use bridge.EmitGameplayCommand(name, payloadJson) for gameplay-facing actions."),
 			*NormalizedModuleName,
 			*Prompt));
-	Messages.Add(MakeShared<FJsonValueObject>(ModuleContextMessage));
 
 	if (!LastGeneratedResult.JavaScript.IsEmpty())
 	{
-		TSharedRef<FJsonObject> CurrentCodeMessage = MakeShared<FJsonObject>();
-		CurrentCodeMessage->SetStringField(TEXT("role"), TEXT("system"));
-		CurrentCodeMessage->SetStringField(
-			TEXT("content"),
+		AddMessage(
+			TEXT("system"),
 			FString::Printf(
 				TEXT("Current generated JavaScript snapshot for %s:\n```javascript\n%s\n```"),
 				*NormalizedModuleName,
 				*LastGeneratedResult.JavaScript));
-		Messages.Add(MakeShared<FJsonValueObject>(CurrentCodeMessage));
 	}
 
 	const int32 StartIndex = FMath::Max(0, ChatMessages.Num() - MaxChatMessagesToSend);
@@ -479,25 +679,41 @@ void UGCAIHotReloadSubsystem::BeginGenerateRequest(
 			continue;
 		}
 
-		TSharedRef<FJsonObject> HistoryMessage = MakeShared<FJsonObject>();
-		HistoryMessage->SetStringField(TEXT("role"), ChatMessage.Role);
-		HistoryMessage->SetStringField(TEXT("content"), ChatMessage.Content);
-		Messages.Add(MakeShared<FJsonValueObject>(HistoryMessage));
+		AddMessage(ChatMessage.Role, ChatMessage.Content);
 	}
 
-	RootObject->SetArrayField(TEXT("messages"), Messages);
+	if (bUseResponsesApi)
+	{
+		RootObject->SetArrayField(TEXT("input"), Messages);
+		RootObject->SetBoolField(TEXT("store"), false);
+	}
+	else
+	{
+		RootObject->SetArrayField(TEXT("messages"), Messages);
+	}
 
 	FString RequestBody;
 	TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
 		TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&RequestBody);
 	FJsonSerializer::Serialize(RootObject, Writer);
 
-	const FString Url = BaseUrl / ProviderConfig.ChatCompletionsPath;
+	const FString RequestPath = ProviderConfig.Transport == EGCAIProviderTransport::GitHubCopilot
+		? TEXT("/v1/responses")
+		: ProviderConfig.ChatCompletionsPath;
+	const FString Url = BuildRequestUrl(BaseUrl, RequestPath);
 	TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Request = FHttpModule::Get().CreateRequest();
 	Request->SetURL(Url);
 	Request->SetVerb(TEXT("POST"));
 	Request->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
 	Request->SetHeader(TEXT("Authorization"), FString::Printf(TEXT("Bearer %s"), *AuthToken));
+	Request->SetHeader(TEXT("Accept"), TEXT("application/json"));
+
+	if (ProviderConfig.Transport == EGCAIProviderTransport::GitHubCopilot)
+	{
+		Request->SetHeader(TEXT("Editor-Version"), CopilotEditorVersion);
+		Request->SetHeader(TEXT("User-Agent"), CopilotUserAgent);
+		Request->SetHeader(TEXT("X-Github-Api-Version"), CopilotApiVersion);
+	}
 
 	for (const TPair<FString, FString>& HeaderPair : ProviderConfig.ExtraHeaders)
 	{
@@ -511,7 +727,7 @@ void UGCAIHotReloadSubsystem::BeginGenerateRequest(
 		NormalizedModuleName);
 	PendingGenerationRequest = Request;
 	Request->ProcessRequest();
-	OnRuntimeLog.Broadcast(FString::Printf(TEXT("Submitting AI hotfix generation request to %s"), *ProviderConfig.ProviderId));
+	OnRuntimeLog.Broadcast(FString::Printf(TEXT("Submitting AI hotfix generation request to %s with model %s"), *ProviderConfig.ProviderId, *RequestModel));
 }
 
 void UGCAIHotReloadSubsystem::HandleCopilotTokenResponse(
@@ -581,6 +797,7 @@ void UGCAIHotReloadSubsystem::HandleCopilotDeviceCodeResponse(
 	PendingCopilotDeviceCode = DeviceCode;
 	CopilotDeviceAuthState.bIsPending = true;
 	CopilotDeviceAuthState.StatusMessage = TEXT("Open GitHub and approve this device.");
+	EmitRuntimeLog(TEXT("GitHub device code received. Waiting for user approval."));
 	BroadcastCopilotDeviceAuthUpdated();
 
 	const FString LaunchUrl = CopilotDeviceAuthState.VerificationUriComplete.IsEmpty()
@@ -603,12 +820,14 @@ void UGCAIHotReloadSubsystem::HandleCopilotDeviceAccessTokenResponse(
 
 	if (!bWasSuccessful || !Response.IsValid())
 	{
+		EmitRuntimeLog(TEXT("GitHub device token polling failed before a valid response was received. Retrying."));
 		ScheduleCopilotDeviceTokenPoll(FMath::Max(1, CopilotDeviceAuthState.PollIntervalSeconds));
 		return;
 	}
 
 	if (Response->GetResponseCode() < 200 || Response->GetResponseCode() >= 300)
 	{
+		EmitRuntimeLog(FString::Printf(TEXT("GitHub device token polling returned HTTP %d. Retrying."), Response->GetResponseCode()));
 		ScheduleCopilotDeviceTokenPoll(FMath::Max(1, CopilotDeviceAuthState.PollIntervalSeconds));
 		return;
 	}
@@ -631,6 +850,8 @@ void UGCAIHotReloadSubsystem::HandleCopilotDeviceAccessTokenResponse(
 		CopilotDeviceAuthState.bIsAuthenticated = true;
 		CopilotDeviceAuthState.StatusMessage = TEXT("GitHub device login complete.");
 		PendingCopilotDeviceCode.Reset();
+		SaveProviderConfigCache();
+		EmitRuntimeLog(TEXT("GitHub device login complete. Copilot token stored in runtime config."));
 		BroadcastCopilotDeviceAuthUpdated();
 		return;
 	}
@@ -643,6 +864,7 @@ void UGCAIHotReloadSubsystem::HandleCopilotDeviceAccessTokenResponse(
 	if (ErrorCode == TEXT("authorization_pending"))
 	{
 		CopilotDeviceAuthState.StatusMessage = TEXT("Waiting for GitHub authorization...");
+		EmitRuntimeLog(TEXT("GitHub authorization still pending."));
 		BroadcastCopilotDeviceAuthUpdated();
 		ScheduleCopilotDeviceTokenPoll(FMath::Max(1, CopilotDeviceAuthState.PollIntervalSeconds));
 		return;
@@ -652,6 +874,7 @@ void UGCAIHotReloadSubsystem::HandleCopilotDeviceAccessTokenResponse(
 	{
 		CopilotDeviceAuthState.PollIntervalSeconds = FMath::Max(5, CopilotDeviceAuthState.PollIntervalSeconds + 5);
 		CopilotDeviceAuthState.StatusMessage = TEXT("GitHub asked to slow down polling.");
+		EmitRuntimeLog(TEXT("GitHub asked the device flow to slow down polling."));
 		BroadcastCopilotDeviceAuthUpdated();
 		ScheduleCopilotDeviceTokenPoll(CopilotDeviceAuthState.PollIntervalSeconds);
 		return;
@@ -726,28 +949,75 @@ bool UGCAIHotReloadSubsystem::TryParseGenerationResponse(const FString& Response
 		return false;
 	}
 
-	const TArray<TSharedPtr<FJsonValue>>* Choices = nullptr;
-	if (!Root->TryGetArrayField(TEXT("choices"), Choices) || !Choices || Choices->Num() == 0)
-	{
-		return false;
-	}
-
-	const TSharedPtr<FJsonObject>* ChoiceObject = nullptr;
-	if (!(*Choices)[0]->TryGetObject(ChoiceObject) || !ChoiceObject || !ChoiceObject->IsValid())
-	{
-		return false;
-	}
-
-	const TSharedPtr<FJsonObject>* MessageObject = nullptr;
-	if (!(*ChoiceObject)->TryGetObjectField(TEXT("message"), MessageObject) || !MessageObject || !MessageObject->IsValid())
-	{
-		return false;
-	}
-
 	FString Content;
-	if (!(*MessageObject)->TryGetStringField(TEXT("content"), Content))
+
+	if (!Root->TryGetStringField(TEXT("output_text"), Content) || Content.IsEmpty())
 	{
-		return false;
+		const TArray<TSharedPtr<FJsonValue>>* OutputItems = nullptr;
+		if (Root->TryGetArrayField(TEXT("output"), OutputItems) && OutputItems)
+		{
+			for (const TSharedPtr<FJsonValue>& OutputValue : *OutputItems)
+			{
+				const TSharedPtr<FJsonObject>* OutputObject = nullptr;
+				if (!OutputValue.IsValid() || !OutputValue->TryGetObject(OutputObject) || !OutputObject || !OutputObject->IsValid())
+				{
+					continue;
+				}
+
+				const TArray<TSharedPtr<FJsonValue>>* OutputContent = nullptr;
+				if (!(*OutputObject)->TryGetArrayField(TEXT("content"), OutputContent) || !OutputContent)
+				{
+					continue;
+				}
+
+				for (const TSharedPtr<FJsonValue>& ContentValue : *OutputContent)
+				{
+					const TSharedPtr<FJsonObject>* ContentObject = nullptr;
+					if (!ContentValue.IsValid() || !ContentValue->TryGetObject(ContentObject) || !ContentObject || !ContentObject->IsValid())
+					{
+						continue;
+					}
+
+					FString PartType;
+					if (!(*ContentObject)->TryGetStringField(TEXT("type"), PartType) || PartType != TEXT("output_text"))
+					{
+						continue;
+					}
+
+					FString PartText;
+					if ((*ContentObject)->TryGetStringField(TEXT("text"), PartText) && !PartText.IsEmpty())
+					{
+						Content += PartText;
+					}
+				}
+			}
+		}
+	}
+
+	if (Content.IsEmpty())
+	{
+		const TArray<TSharedPtr<FJsonValue>>* Choices = nullptr;
+		if (!Root->TryGetArrayField(TEXT("choices"), Choices) || !Choices || Choices->Num() == 0)
+		{
+			return false;
+		}
+
+		const TSharedPtr<FJsonObject>* ChoiceObject = nullptr;
+		if (!(*Choices)[0]->TryGetObject(ChoiceObject) || !ChoiceObject || !ChoiceObject->IsValid())
+		{
+			return false;
+		}
+
+		const TSharedPtr<FJsonObject>* MessageObject = nullptr;
+		if (!(*ChoiceObject)->TryGetObjectField(TEXT("message"), MessageObject) || !MessageObject || !MessageObject->IsValid())
+		{
+			return false;
+		}
+
+		if (!(*MessageObject)->TryGetStringField(TEXT("content"), Content))
+		{
+			return false;
+		}
 	}
 
 	TSharedPtr<FJsonObject> Payload;

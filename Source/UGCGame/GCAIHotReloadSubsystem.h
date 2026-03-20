@@ -8,6 +8,7 @@
 #include "GCAIHotReloadSubsystem.generated.h"
 
 class UGCAIHotfixBridge;
+class UGCAIHotReloadChatWidget;
 
 UCLASS(BlueprintType)
 class UGCAIHotReloadSubsystem : public UGameInstanceSubsystem
@@ -91,6 +92,8 @@ public:
 	FGCAICopilotDeviceAuthUpdatedDelegate OnCopilotDeviceAuthUpdated;
 
 private:
+	void HandleWorldPostInitialization(UWorld* InWorld, const UWorld::InitializationValues IVS);
+	void TryShowChatWidget(UWorld* InWorld);
 	void ShutdownJsEnv();
 	bool StartJsEnvForModule(const FString& ModuleName, FString& OutError);
 	bool WriteHotfixFiles(const FString& ModuleName, const FString& SourceCode, FString& OutModuleName, FString& OutError) const;
@@ -103,6 +106,9 @@ private:
 	void BroadcastCopilotDeviceAuthUpdated();
 	void ScheduleCopilotDeviceTokenPoll(float DelaySeconds);
 	void ResetCopilotDeviceLogin(bool bKeepAuthenticatedState);
+	void LoadProviderConfigCache();
+	void SaveProviderConfigCache() const;
+	FString GetProviderConfigCachePath() const;
 	void HandleCopilotDeviceCodeResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bWasSuccessful);
 	void HandleCopilotDeviceAccessTokenResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bWasSuccessful);
 	void HandleCopilotTokenResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bWasSuccessful, FString Prompt, FString TargetModuleName);
@@ -120,6 +126,9 @@ private:
 	UPROPERTY(Transient)
 	TObjectPtr<UGCAIHotfixBridge> Bridge;
 
+	UPROPERTY(Transient)
+	TObjectPtr<UGCAIHotReloadChatWidget> RuntimeChatWidget;
+
 	FString ActiveModuleName;
 	TSharedPtr<IHttpRequest, ESPMode::ThreadSafe> PendingGenerationRequest;
 	TSharedPtr<IHttpRequest, ESPMode::ThreadSafe> PendingCopilotAuthRequest;
@@ -130,4 +139,5 @@ private:
 	FGCAICopilotDeviceAuthState CopilotDeviceAuthState;
 	FString PendingCopilotDeviceCode;
 	FTimerHandle CopilotDevicePollTimer;
+	FDelegateHandle WorldBeginPlayHandle;
 };

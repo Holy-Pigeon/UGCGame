@@ -6,8 +6,11 @@
 #include "GCAIHotReloadChatWidget.generated.h"
 
 class UButton;
+class UBorder;
+class UComboBoxString;
 class UEditableTextBox;
 class UMultiLineEditableTextBox;
+class UScrollBox;
 class UTextBlock;
 class UVerticalBox;
 
@@ -17,12 +20,14 @@ class UGCAIHotReloadChatWidget : public UUserWidget
 	GENERATED_BODY()
 
 public:
+	virtual TSharedRef<SWidget> RebuildWidget() override;
 	virtual void NativeConstruct() override;
 
 private:
 	void BuildUi();
 	void RefreshFromSubsystem();
 	void RebuildTranscript();
+	void RebuildRuntimeLog();
 	class UGCAIHotReloadSubsystem* GetHotReloadSubsystem() const;
 
 	UFUNCTION()
@@ -53,19 +58,22 @@ private:
 	void HandleCopilotDeviceAuthUpdated(const FGCAICopilotDeviceAuthState& State);
 
 	UPROPERTY()
-	TObjectPtr<UMultiLineEditableTextBox> TranscriptTextBox;
+	TObjectPtr<UScrollBox> ChatScrollBox;
+
+	UPROPERTY()
+	TObjectPtr<UVerticalBox> ChatMessagesBox;
+
+	UPROPERTY()
+	TObjectPtr<UMultiLineEditableTextBox> RuntimeLogTextBox;
 
 	UPROPERTY()
 	TObjectPtr<UMultiLineEditableTextBox> PromptInputTextBox;
 
 	UPROPERTY()
-	TObjectPtr<UMultiLineEditableTextBox> CodePreviewTextBox;
-
-	UPROPERTY()
 	TObjectPtr<UEditableTextBox> GitHubTokenTextBox;
 
 	UPROPERTY()
-	TObjectPtr<UEditableTextBox> ModelTextBox;
+	TObjectPtr<UComboBoxString> ModelComboBox;
 
 	UPROPERTY()
 	TObjectPtr<UTextBlock> CopilotAuthText;
@@ -75,6 +83,12 @@ private:
 
 	UPROPERTY()
 	TObjectPtr<UTextBlock> StatusText;
+
+	UPROPERTY()
+	TObjectPtr<UBorder> AuthStatusBorder;
+
+	UPROPERTY()
+	TObjectPtr<UTextBlock> AuthStatusText;
 
 	UPROPERTY()
 	TObjectPtr<UButton> DeviceLoginButton;
