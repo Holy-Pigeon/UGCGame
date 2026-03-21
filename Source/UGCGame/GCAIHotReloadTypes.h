@@ -82,6 +82,12 @@ struct FGCAIChatMessage
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Chat")
 	FString Content;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Chat")
+	FString Kind = TEXT("message");
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Chat")
+	FString Title;
 };
 
 USTRUCT(BlueprintType)

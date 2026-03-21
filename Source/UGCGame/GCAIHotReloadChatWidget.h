@@ -5,14 +5,8 @@
 #include "GCAIHotReloadTypes.h"
 #include "GCAIHotReloadChatWidget.generated.h"
 
-class UButton;
-class UBorder;
-class UComboBoxString;
-class UEditableTextBox;
-class UMultiLineEditableTextBox;
-class UScrollBox;
-class UTextBlock;
-class UVerticalBox;
+enum class EWebBrowserConsoleLogSeverity;
+class SWebBrowser;
 
 UCLASS()
 class UGCAIHotReloadChatWidget : public UUserWidget
@@ -22,22 +16,32 @@ class UGCAIHotReloadChatWidget : public UUserWidget
 public:
 	virtual TSharedRef<SWidget> RebuildWidget() override;
 	virtual void NativeConstruct() override;
+	virtual void NativeDestruct() override;
+	virtual void ReleaseSlateResources(bool bReleaseChildren) override;
 
 private:
-	void BuildUi();
 	void RefreshFromSubsystem();
-	void RebuildTranscript();
-	void RebuildRuntimeLog();
+	void SyncBrowserState(bool bHydrateInputs);
+	void PushBrowserState(bool bHydrateInputs);
 	class UGCAIHotReloadSubsystem* GetHotReloadSubsystem() const;
+	FString BuildPageStateJson(bool bHydrateInputs) const;
+	static FString BuildHtmlDocument();
+	void HandleBrowserLoadCompleted();
+	void HandleBrowserConsoleMessage(const FString& Message, const FString& Source, int32 Line, EWebBrowserConsoleLogSeverity Severity);
+	void LoadBrowserDocument();
+	void UpdateDraftFields(const FString& Token, const FString& Model, const FString& ModuleName, const FString& Prompt);
 
 	UFUNCTION()
-	void HandleGenerateClicked();
+	void UpdateDraft(const FString& Token, const FString& Model, const FString& ModuleName, const FString& Prompt);
 
 	UFUNCTION()
-	void HandleDeviceLoginClicked();
+	void Send(const FString& Token, const FString& Model, const FString& ModuleName, const FString& Prompt);
 
 	UFUNCTION()
-	void HandleReloadClicked();
+	void Login(const FString& Token, const FString& Model, const FString& ModuleName, const FString& Prompt);
+
+	UFUNCTION()
+	void Reload();
 
 	UFUNCTION()
 	void HandleChatSessionChanged();
@@ -57,47 +61,14 @@ private:
 	UFUNCTION()
 	void HandleCopilotDeviceAuthUpdated(const FGCAICopilotDeviceAuthState& State);
 
-	UPROPERTY()
-	TObjectPtr<UScrollBox> ChatScrollBox;
-
-	UPROPERTY()
-	TObjectPtr<UVerticalBox> ChatMessagesBox;
-
-	UPROPERTY()
-	TObjectPtr<UMultiLineEditableTextBox> RuntimeLogTextBox;
-
-	UPROPERTY()
-	TObjectPtr<UMultiLineEditableTextBox> PromptInputTextBox;
-
-	UPROPERTY()
-	TObjectPtr<UEditableTextBox> GitHubTokenTextBox;
-
-	UPROPERTY()
-	TObjectPtr<UComboBoxString> ModelComboBox;
-
-	UPROPERTY()
-	TObjectPtr<UTextBlock> CopilotAuthText;
-
-	UPROPERTY()
-	TObjectPtr<UEditableTextBox> ModuleNameTextBox;
-
-	UPROPERTY()
-	TObjectPtr<UTextBlock> StatusText;
-
-	UPROPERTY()
-	TObjectPtr<UBorder> AuthStatusBorder;
-
-	UPROPERTY()
-	TObjectPtr<UTextBlock> AuthStatusText;
-
-	UPROPERTY()
-	TObjectPtr<UButton> DeviceLoginButton;
-
-	UPROPERTY()
-	TObjectPtr<UButton> GenerateButton;
-
-	UPROPERTY()
-	TObjectPtr<UButton> ReloadButton;
-
+	TSharedPtr<SWebBrowser> BrowserWidget;
 	TArray<FString> RuntimeLines;
+	FGCAICopilotDeviceAuthState CopilotDeviceAuthState;
+	FString StatusMessage = TEXT("Ready");
+	FString DraftGitHubToken;
+	FString DraftPrompt;
+	FString DraftModuleName = TEXT("AIHotfix/Generated/Current");
+	FString DraftModel = TEXT("gpt-5.2");
+	bool bBrowserReady = false;
+	bool bIsGenerating = false;
 };

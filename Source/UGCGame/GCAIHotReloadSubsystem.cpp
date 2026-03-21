@@ -1,9 +1,7 @@
 #include "GCAIHotReloadSubsystem.h"
 
 #include "GCAIHotReloadSettings.h"
-#include "GCAIHotReloadChatWidget.h"
 #include "GCAIHotfixBridge.h"
-#include "Blueprint/UserWidget.h"
 #include "Engine/World.h"
 #include "HttpModule.h"
 #include "HAL/PlatformProcess.h"
@@ -15,8 +13,8 @@
 #include "Policies/CondensedJsonPrintPolicy.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
+#include "String/ParseTokens.h"
 #include "TimerManager.h"
-#include "Engine/Engine.h"
 
 namespace
 {
@@ -32,6 +30,23 @@ const FString CopilotEditorVersion = TEXT("vscode/1.96.2");
 const FString CopilotUserAgent = TEXT("GitHubCopilotChat/0.26.7");
 const FString CopilotApiVersion = TEXT("2025-04-01");
 constexpr int32 MaxChatMessagesToSend = 12;
+constexpr int32 MaxAgentTurns = 6;
+constexpr int32 MaxToolCallsPerTurn = 3;
+constexpr int32 MaxToolResultChars = 12000;
+constexpr int64 MaxReadableFileBytes = 64 * 1024;
+
+struct FAgentToolCall
+{
+	FString Tool;
+	TSharedPtr<FJsonObject> Args;
+};
+
+struct FAgentResponsePayload
+{
+	FString AssistantMessage;
+	TArray<FAgentToolCall> ToolCalls;
+	bool bDone = false;
+};
 
 bool IsCopilotResponsesModelSupported(const FString& Model)
 {
@@ -70,6 +85,138 @@ FString BuildRequestUrl(const FString& BaseUrl, const FString& Path)
 
 	return NormalizedBaseUrl + NormalizeRequestPath(Path, TEXT("/v1/responses"));
 }
+
+FString SerializeJsonObject(const TSharedPtr<FJsonObject>& Object)
+{
+	if (!Object.IsValid())
+	{
+		return TEXT("{}");
+	}
+
+	FString Output;
+	const TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
+		TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&Output);
+	FJsonSerializer::Serialize(Object.ToSharedRef(), Writer);
+	return Output;
+}
+
+FString TruncateForToolResult(const FString& Text)
+{
+	if (Text.Len() <= MaxToolResultChars)
+	{
+		return Text;
+	}
+
+	return Text.Left(MaxToolResultChars) +
+		FString::Printf(TEXT("\n\n... truncated (%d chars total)."), Text.Len());
+}
+
+bool ParseAgentResponsePayload(const FString& Content, FAgentResponsePayload& OutPayload)
+{
+	TSharedPtr<FJsonObject> Root;
+	const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Content);
+	if (!FJsonSerializer::Deserialize(Reader, Root) || !Root.IsValid())
+	{
+		return false;
+	}
+
+	Root->TryGetStringField(TEXT("assistant_message"), OutPayload.AssistantMessage);
+	if (OutPayload.AssistantMessage.IsEmpty())
+	{
+		Root->TryGetStringField(TEXT("message"), OutPayload.AssistantMessage);
+	}
+	if (OutPayload.AssistantMessage.IsEmpty())
+	{
+		Root->TryGetStringField(TEXT("reply"), OutPayload.AssistantMessage);
+	}
+
+	Root->TryGetBoolField(TEXT("done"), OutPayload.bDone);
+
+	const TArray<TSharedPtr<FJsonValue>>* ToolCallValues = nullptr;
+	if (Root->TryGetArrayField(TEXT("tool_calls"), ToolCallValues) && ToolCallValues)
+	{
+		for (const TSharedPtr<FJsonValue>& ToolCallValue : *ToolCallValues)
+		{
+			const TSharedPtr<FJsonObject>* ToolCallObject = nullptr;
+			if (!ToolCallValue.IsValid() || !ToolCallValue->TryGetObject(ToolCallObject) || !ToolCallObject || !ToolCallObject->IsValid())
+			{
+				continue;
+			}
+
+			FAgentToolCall ToolCall;
+			if (!(*ToolCallObject)->TryGetStringField(TEXT("tool"), ToolCall.Tool) || ToolCall.Tool.IsEmpty())
+			{
+				continue;
+			}
+
+			const TSharedPtr<FJsonObject>* ArgsObject = nullptr;
+			if ((*ToolCallObject)->TryGetObjectField(TEXT("args"), ArgsObject) && ArgsObject && ArgsObject->IsValid())
+			{
+				ToolCall.Args = *ArgsObject;
+			}
+			else
+			{
+				ToolCall.Args = MakeShared<FJsonObject>();
+			}
+
+			OutPayload.ToolCalls.Add(MoveTemp(ToolCall));
+			if (OutPayload.ToolCalls.Num() >= MaxToolCallsPerTurn)
+			{
+				break;
+			}
+		}
+	}
+
+	return true;
+}
+
+bool ResolveReadableProjectPath(const FString& ProjectDir, const FString& RequestedPath, FString& OutAbsolutePath)
+{
+	FString Normalized = RequestedPath.TrimStartAndEnd();
+	if (Normalized.IsEmpty())
+	{
+		return false;
+	}
+
+	Normalized.ReplaceInline(TEXT("\\"), TEXT("/"));
+	while (Normalized.StartsWith(TEXT("./")))
+	{
+		Normalized.RightChopInline(2, EAllowShrinking::No);
+	}
+
+	if (Normalized.Contains(TEXT("..")))
+	{
+		return false;
+	}
+
+	if (!(Normalized.StartsWith(TEXT("Source/")) ||
+		Normalized.StartsWith(TEXT("Config/")) ||
+		Normalized.StartsWith(TEXT("Content/")) ||
+		Normalized.EndsWith(TEXT(".uproject"))))
+	{
+		return false;
+	}
+
+	const FString AbsolutePath = FPaths::ConvertRelativePathToFull(FPaths::Combine(ProjectDir, Normalized));
+	if (!AbsolutePath.StartsWith(ProjectDir))
+	{
+		return false;
+	}
+
+	if (!FPaths::FileExists(AbsolutePath))
+	{
+		return false;
+	}
+
+	const int64 FileSize = IFileManager::Get().FileSize(*AbsolutePath);
+	if (FileSize < 0 || FileSize > MaxReadableFileBytes)
+	{
+		return false;
+	}
+
+	OutAbsolutePath = AbsolutePath;
+	return true;
+}
 }
 
 void UGCAIHotReloadSubsystem::Initialize(FSubsystemCollectionBase& Collection)
@@ -82,18 +229,10 @@ void UGCAIHotReloadSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 
 	Bridge = NewObject<UGCAIHotfixBridge>(this);
 	Bridge->Initialize(this);
-
-	WorldBeginPlayHandle = FWorldDelegates::OnPostWorldInitialization.AddUObject(this, &UGCAIHotReloadSubsystem::HandleWorldPostInitialization);
 }
 
 void UGCAIHotReloadSubsystem::Deinitialize()
 {
-	if (WorldBeginPlayHandle.IsValid())
-	{
-		FWorldDelegates::OnPostWorldInitialization.Remove(WorldBeginPlayHandle);
-		WorldBeginPlayHandle.Reset();
-	}
-
 	if (PendingGenerationRequest.IsValid())
 	{
 		PendingGenerationRequest->OnProcessRequestComplete().Unbind();
@@ -117,65 +256,6 @@ void UGCAIHotReloadSubsystem::Deinitialize()
 	Super::Deinitialize();
 }
 
-void UGCAIHotReloadSubsystem::HandleWorldPostInitialization(UWorld* InWorld, const UWorld::InitializationValues IVS)
-{
-	(void)IVS;
-	TryShowChatWidget(InWorld);
-}
-
-void UGCAIHotReloadSubsystem::TryShowChatWidget(UWorld* InWorld)
-{
-	if (!InWorld)
-	{
-		return;
-	}
-
-	if (InWorld->WorldType != EWorldType::PIE && InWorld->WorldType != EWorldType::Game)
-	{
-		return;
-	}
-
-	const FString CleanMapName = UWorld::RemovePIEPrefix(InWorld->GetMapName());
-	if (!CleanMapName.EndsWith(TEXT("MainScene")))
-	{
-		return;
-	}
-
-	if (RuntimeChatWidget)
-	{
-		return;
-	}
-
-	APlayerController* PlayerController = InWorld->GetFirstPlayerController();
-	if (!PlayerController)
-	{
-		FTimerDelegate RetryDelegate;
-		RetryDelegate.BindUObject(this, &UGCAIHotReloadSubsystem::TryShowChatWidget, InWorld);
-		InWorld->GetTimerManager().SetTimerForNextTick(RetryDelegate);
-		return;
-	}
-
-	PlayerController->bShowMouseCursor = true;
-	PlayerController->SetInputMode(FInputModeGameAndUI());
-
-	RuntimeChatWidget = CreateWidget<UGCAIHotReloadChatWidget>(PlayerController, UGCAIHotReloadChatWidget::StaticClass());
-	if (RuntimeChatWidget)
-	{
-		RuntimeChatWidget->AddToViewport(1000);
-		EmitRuntimeLog(TEXT("AI hotfix chat widget attached to MainScene."));
-		if (GEngine)
-		{
-			GEngine->AddOnScreenDebugMessage(-1, 8.0f, FColor::Green, TEXT("AI hotfix chat widget attached."));
-		}
-	}
-	else
-	{
-		FTimerDelegate RetryDelegate;
-		RetryDelegate.BindUObject(this, &UGCAIHotReloadSubsystem::TryShowChatWidget, InWorld);
-		InWorld->GetTimerManager().SetTimerForNextTick(RetryDelegate);
-	}
-}
-
 void UGCAIHotReloadSubsystem::ConfigureProvider(const FGCAIProviderConfig& InProviderConfig)
 {
 	ProviderConfig = InProviderConfig;
@@ -196,6 +276,11 @@ FGCAIProviderConfig UGCAIHotReloadSubsystem::GetProviderConfig() const
 bool UGCAIHotReloadSubsystem::IsRuntimeReady() const
 {
 	return JsEnv != nullptr;
+}
+
+bool UGCAIHotReloadSubsystem::IsAgentTurnRunning() const
+{
+	return PendingGenerationRequest.IsValid();
 }
 
 FString UGCAIHotReloadSubsystem::GetActiveModuleName() const
@@ -245,10 +330,15 @@ void UGCAIHotReloadSubsystem::RestartHotfixRuntime()
 
 void UGCAIHotReloadSubsystem::GenerateHotfixFromPrompt(const FString& Prompt, const FString& ModuleName)
 {
+	SendAgentPrompt(Prompt, ModuleName);
+}
+
+void UGCAIHotReloadSubsystem::SendAgentPrompt(const FString& Prompt, const FString& ModuleName)
+{
 	const FString TrimmedPrompt = Prompt.TrimStartAndEnd();
 	if (TrimmedPrompt.IsEmpty())
 	{
-		OnHotfixFailed.Broadcast(TEXT("Prompt is empty."));
+		OnHotfixFailed.Broadcast(TEXT("Message is empty."));
 		return;
 	}
 
@@ -266,29 +356,13 @@ void UGCAIHotReloadSubsystem::GenerateHotfixFromPrompt(const FString& Prompt, co
 
 	if (PendingGenerationRequest.IsValid())
 	{
-		OnHotfixFailed.Broadcast(TEXT("A hotfix generation request is already running."));
+		OnHotfixFailed.Broadcast(TEXT("An AI turn is already running."));
 		return;
 	}
 
 	const FString NormalizedModuleName = NormalizeModuleName(ModuleName.IsEmpty() ? GetGeneratedModuleName() : ModuleName);
 	AppendChatMessage(TEXT("user"), TrimmedPrompt);
-
-	if (ProviderConfig.Transport == EGCAIProviderTransport::GitHubCopilot)
-	{
-		TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Request = FHttpModule::Get().CreateRequest();
-		Request->SetURL(CopilotTokenUrl);
-		Request->SetVerb(TEXT("GET"));
-		Request->SetHeader(TEXT("Accept"), TEXT("application/json"));
-		Request->SetHeader(TEXT("Authorization"), FString::Printf(TEXT("Bearer %s"), *ProviderConfig.ApiKey));
-		Request->SetHeader(TEXT("User-Agent"), TEXT("UGCGame/1.0"));
-		Request->OnProcessRequestComplete().BindUObject(this, &UGCAIHotReloadSubsystem::HandleCopilotTokenResponse, TrimmedPrompt, NormalizedModuleName);
-		PendingGenerationRequest = Request;
-		Request->ProcessRequest();
-		OnRuntimeLog.Broadcast(TEXT("Exchanging GitHub token for Copilot API token."));
-		return;
-	}
-
-	BeginGenerateRequest(TrimmedPrompt, NormalizedModuleName, ProviderConfig.BaseUrl, ProviderConfig.ApiKey);
+	BeginAgentTurnWithConfiguredProvider(NormalizedModuleName, MaxAgentTurns);
 }
 
 void UGCAIHotReloadSubsystem::BeginCopilotDeviceLogin()
@@ -373,7 +447,11 @@ void UGCAIHotReloadSubsystem::EmitRuntimeLog(const FString& Message)
 	OnRuntimeLog.Broadcast(Message);
 }
 
-void UGCAIHotReloadSubsystem::AppendChatMessage(const FString& Role, const FString& Content)
+void UGCAIHotReloadSubsystem::AppendChatMessage(
+	const FString& Role,
+	const FString& Content,
+	const FString& Kind,
+	const FString& Title)
 {
 	const FString TrimmedContent = Content.TrimStartAndEnd();
 	if (TrimmedContent.IsEmpty())
@@ -384,6 +462,8 @@ void UGCAIHotReloadSubsystem::AppendChatMessage(const FString& Role, const FStri
 	FGCAIChatMessage Message;
 	Message.Role = Role;
 	Message.Content = TrimmedContent;
+	Message.Kind = Kind.IsEmpty() ? TEXT("message") : Kind;
+	Message.Title = Title;
 	ChatMessages.Add(MoveTemp(Message));
 	BroadcastChatSessionChanged();
 }
@@ -598,22 +678,57 @@ FString UGCAIHotReloadSubsystem::GetAbsoluteScriptPathForModule(const FString& M
 	return FPaths::Combine(FPaths::ProjectContentDir(), Settings->ScriptRoot, RelativeModulePath);
 }
 
-FString UGCAIHotReloadSubsystem::BuildSystemPrompt() const
+FString UGCAIHotReloadSubsystem::BuildAgentSystemPrompt() const
 {
-	const UGCAIHotReloadSettings* Settings = GetDefault<UGCAIHotReloadSettings>();
-
-	return Settings->SystemPrompt +
-		TEXT("\nUse only these safe bridge calls: bridge.LogMessage(text), bridge.EmitGameplayCommand(name, payloadJson), bridge.GetWorldSeconds(), bridge.GetActiveModuleName().") +
-			TEXT("\nAvoid direct engine globals unless required through puerts modules.") +
-			TEXT("\nThe module should run from top-level when loaded and may export helper functions if useful.") +
-			TEXT("\nDo not assume hotfix code is live until the user presses Reload in the game UI.");
+	return TEXT(
+		"You are an Unreal Engine hotfix agent inside a live chat window. "
+		"Talk to the user naturally, but return JSON only with keys assistant_message, tool_calls, and done. "
+		"assistant_message must be plain language for the user. "
+		"tool_calls must be an array of objects shaped like {\"tool\":\"name\",\"args\":{...}}. "
+		"Set done=true only when you have finished the current turn and do not need more tool calls. "
+		"Available tools: "
+		"get_bridge_api(), "
+		"get_runtime_state(), "
+		"read_project_file(path), "
+		"read_generated_hotfix(module_name), "
+		"write_hotfix_file(module_name, javascript, typescript?), "
+		"apply_hotfix(), "
+		"reload_hotfix(). "
+		"When you need project facts, call a tool instead of guessing. "
+		"When you write hotfix JavaScript, it must be CommonJS and should start with "
+		"const { argv } = require('puerts'); const bridge = argv.getByName('Bridge'); "
+		"Use only these safe bridge calls: bridge.LogMessage(text), bridge.EmitGameplayCommand(name, payloadJson), bridge.GetWorldSeconds(), bridge.GetActiveModuleName(). "
+		"Avoid direct engine globals unless required through puerts modules. "
+		"The module should run from top-level when loaded and may export helper functions if useful. "
+		"Do not claim code is live unless apply_hotfix or reload_hotfix has already succeeded. "
+		"Do not dump full code into assistant_message unless the user explicitly asks to see it.");
 }
 
-void UGCAIHotReloadSubsystem::BeginGenerateRequest(
-	const FString& Prompt,
+void UGCAIHotReloadSubsystem::BeginAgentTurnWithConfiguredProvider(const FString& NormalizedModuleName, int32 RemainingSteps)
+{
+	if (ProviderConfig.Transport == EGCAIProviderTransport::GitHubCopilot)
+	{
+		TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Request = FHttpModule::Get().CreateRequest();
+		Request->SetURL(CopilotTokenUrl);
+		Request->SetVerb(TEXT("GET"));
+		Request->SetHeader(TEXT("Accept"), TEXT("application/json"));
+		Request->SetHeader(TEXT("Authorization"), FString::Printf(TEXT("Bearer %s"), *ProviderConfig.ApiKey));
+		Request->SetHeader(TEXT("User-Agent"), TEXT("UGCGame/1.0"));
+		Request->OnProcessRequestComplete().BindUObject(this, &UGCAIHotReloadSubsystem::HandleCopilotTokenResponse, NormalizedModuleName, RemainingSteps);
+		PendingGenerationRequest = Request;
+		Request->ProcessRequest();
+		OnRuntimeLog.Broadcast(TEXT("Exchanging GitHub token for Copilot API token."));
+		return;
+	}
+
+	BeginAgentTurn(NormalizedModuleName, ProviderConfig.BaseUrl, ProviderConfig.ApiKey, RemainingSteps);
+}
+
+void UGCAIHotReloadSubsystem::BeginAgentTurn(
 	const FString& NormalizedModuleName,
 	const FString& BaseUrl,
-	const FString& AuthToken)
+	const FString& AuthToken,
+	int32 RemainingSteps)
 {
 	TSharedRef<FJsonObject> RootObject = MakeShared<FJsonObject>();
 	const FString RequestModel = ProviderConfig.Transport == EGCAIProviderTransport::GitHubCopilot
@@ -652,13 +767,13 @@ void UGCAIHotReloadSubsystem::BeginGenerateRequest(
  		Messages.Add(MakeShared<FJsonValueObject>(Message));
 	};
 
-	AddMessage(TEXT("system"), BuildSystemPrompt());
+	AddMessage(TEXT("system"), BuildAgentSystemPrompt());
 	AddMessage(
 		TEXT("system"),
 		FString::Printf(
-			TEXT("Target module for this conversation: %s.\nLatest user request: %s\nReturn JSON only. Use bridge.EmitGameplayCommand(name, payloadJson) for gameplay-facing actions."),
+			TEXT("Target hotfix module: %s.\nRemaining agent turns in this run: %d."),
 			*NormalizedModuleName,
-			*Prompt));
+			RemainingSteps));
 
 	if (!LastGeneratedResult.JavaScript.IsEmpty())
 	{
@@ -670,16 +785,42 @@ void UGCAIHotReloadSubsystem::BeginGenerateRequest(
 				*LastGeneratedResult.JavaScript));
 	}
 
+	AddMessage(
+		TEXT("system"),
+		FString::Printf(
+			TEXT("Runtime state: active_module=%s, runtime_ready=%s, pending_hotfix=%s."),
+			*GetActiveModuleName(),
+			IsRuntimeReady() ? TEXT("true") : TEXT("false"),
+			HasPendingHotfix() ? TEXT("true") : TEXT("false")));
+
 	const int32 StartIndex = FMath::Max(0, ChatMessages.Num() - MaxChatMessagesToSend);
 	for (int32 Index = StartIndex; Index < ChatMessages.Num(); ++Index)
 	{
 		const FGCAIChatMessage& ChatMessage = ChatMessages[Index];
-		if (ChatMessage.Role != TEXT("user") && ChatMessage.Role != TEXT("assistant"))
+
+		if (ChatMessage.Role == TEXT("user"))
 		{
+			AddMessage(TEXT("user"), ChatMessage.Content);
 			continue;
 		}
 
-		AddMessage(ChatMessage.Role, ChatMessage.Content);
+		if (ChatMessage.Role == TEXT("assistant") && (ChatMessage.Kind.IsEmpty() || ChatMessage.Kind == TEXT("message")))
+		{
+			AddMessage(TEXT("assistant"), ChatMessage.Content);
+			continue;
+		}
+
+		if (ChatMessage.Kind == TEXT("tool_call"))
+		{
+			AddMessage(TEXT("system"), FString::Printf(TEXT("Tool call [%s]: %s"), *ChatMessage.Title, *ChatMessage.Content));
+			continue;
+		}
+
+		if (ChatMessage.Kind == TEXT("tool_result"))
+		{
+			AddMessage(TEXT("system"), FString::Printf(TEXT("Tool result [%s]: %s"), *ChatMessage.Title, *ChatMessage.Content));
+			continue;
+		}
 	}
 
 	if (bUseResponsesApi)
@@ -723,19 +864,20 @@ void UGCAIHotReloadSubsystem::BeginGenerateRequest(
 	Request->SetContentAsString(RequestBody);
 	Request->OnProcessRequestComplete().BindUObject(
 		this,
-		&UGCAIHotReloadSubsystem::HandleGenerateHotfixResponse,
-		NormalizedModuleName);
+		&UGCAIHotReloadSubsystem::HandleAgentTurnResponse,
+		NormalizedModuleName,
+		RemainingSteps);
 	PendingGenerationRequest = Request;
 	Request->ProcessRequest();
-	OnRuntimeLog.Broadcast(FString::Printf(TEXT("Submitting AI hotfix generation request to %s with model %s"), *ProviderConfig.ProviderId, *RequestModel));
+	OnRuntimeLog.Broadcast(FString::Printf(TEXT("Submitting AI agent turn to %s with model %s"), *ProviderConfig.ProviderId, *RequestModel));
 }
 
 void UGCAIHotReloadSubsystem::HandleCopilotTokenResponse(
 	FHttpRequestPtr Request,
 	FHttpResponsePtr Response,
 	bool bWasSuccessful,
-	FString Prompt,
-	FString TargetModuleName)
+	FString TargetModuleName,
+	int32 RemainingSteps)
 {
 	PendingGenerationRequest.Reset();
 
@@ -761,7 +903,7 @@ void UGCAIHotReloadSubsystem::HandleCopilotTokenResponse(
 		return;
 	}
 
-	BeginGenerateRequest(Prompt, TargetModuleName, CopilotBaseUrl, CopilotToken);
+	BeginAgentTurn(TargetModuleName, CopilotBaseUrl, CopilotToken, RemainingSteps);
 }
 
 void UGCAIHotReloadSubsystem::HandleCopilotDeviceCodeResponse(
@@ -887,60 +1029,227 @@ void UGCAIHotReloadSubsystem::HandleCopilotDeviceAccessTokenResponse(
 			: FString::Printf(TEXT("GitHub device login failed: %s"), *ErrorDescription));
 }
 
-void UGCAIHotReloadSubsystem::HandleGenerateHotfixResponse(
+void UGCAIHotReloadSubsystem::HandleAgentTurnResponse(
 	FHttpRequestPtr Request,
 	FHttpResponsePtr Response,
 	bool bWasSuccessful,
-	FString TargetModuleName)
+	FString TargetModuleName,
+	int32 RemainingSteps)
 {
 	PendingGenerationRequest.Reset();
 
 	if (!bWasSuccessful || !Response.IsValid())
 	{
-		OnHotfixFailed.Broadcast(TEXT("Hotfix generation request failed before a response was received."));
+		OnHotfixFailed.Broadcast(TEXT("AI agent turn failed before a response was received."));
 		return;
 	}
 
 	if (Response->GetResponseCode() < 200 || Response->GetResponseCode() >= 300)
 	{
-		OnHotfixFailed.Broadcast(FString::Printf(TEXT("Hotfix generation failed with HTTP %d: %s"), Response->GetResponseCode(), *Response->GetContentAsString()));
+		OnHotfixFailed.Broadcast(FString::Printf(TEXT("AI agent turn failed with HTTP %d: %s"), Response->GetResponseCode(), *Response->GetContentAsString()));
 		return;
 	}
 
-	FGCAIHotfixGenerationResult Result;
-	Result.ModuleName = TargetModuleName;
-
-	if (!TryParseGenerationResponse(Response->GetContentAsString(), Result))
+	FString AssistantContent;
+	if (!TryExtractAssistantText(Response->GetContentAsString(), AssistantContent))
 	{
-		Result.Error = TEXT("Could not parse model response into a hotfix module.");
-		OnHotfixGenerated.Broadcast(Result);
-		OnHotfixFailed.Broadcast(Result.Error);
+		OnHotfixFailed.Broadcast(TEXT("Could not parse model response from the AI agent."));
 		return;
 	}
 
-	Result.ModuleName = TargetModuleName;
-	PendingGeneratedModuleName = TargetModuleName;
-	PendingGeneratedSource = Result.JavaScript;
-	LastGeneratedResult = Result;
-	FString SavedModuleName;
-	FString Error;
-	if (!WriteHotfixFiles(TargetModuleName, Result.JavaScript, SavedModuleName, Error))
+	FAgentResponsePayload AgentPayload;
+	if (!ParseAgentResponsePayload(AssistantContent, AgentPayload))
 	{
-		Result.Error = Error;
-		OnHotfixGenerated.Broadcast(Result);
-		OnHotfixFailed.Broadcast(Result.Error);
+		AppendChatMessage(TEXT("assistant"), AssistantContent);
 		return;
 	}
 
-	Result.Summary = Result.Summary.IsEmpty()
-		? TEXT("Generated hotfix code is ready. Press Reload to make it live.")
-		: Result.Summary + TEXT(" Press Reload to make it live.");
-	LastGeneratedResult = Result;
-	AppendChatMessage(TEXT("assistant"), Result.Summary);
-	OnHotfixGenerated.Broadcast(Result);
+	if (!AgentPayload.AssistantMessage.IsEmpty())
+	{
+		AppendChatMessage(TEXT("assistant"), AgentPayload.AssistantMessage);
+	}
+
+	auto ExecuteToolCall = [this, &TargetModuleName](const FAgentToolCall& ToolCall, FString& OutResultText) -> bool
+	{
+		const TSharedPtr<FJsonObject> Args = ToolCall.Args.IsValid() ? ToolCall.Args : MakeShared<FJsonObject>();
+
+		if (ToolCall.Tool == TEXT("get_bridge_api"))
+		{
+			OutResultText =
+				TEXT("Safe bridge API:\n")
+				TEXT("- bridge.LogMessage(text)\n")
+				TEXT("- bridge.EmitGameplayCommand(name, payloadJson)\n")
+				TEXT("- bridge.GetWorldSeconds()\n")
+				TEXT("- bridge.GetActiveModuleName()");
+			return true;
+		}
+
+		if (ToolCall.Tool == TEXT("get_runtime_state"))
+		{
+			TSharedRef<FJsonObject> StateObject = MakeShared<FJsonObject>();
+			StateObject->SetBoolField(TEXT("runtime_ready"), IsRuntimeReady());
+			StateObject->SetStringField(TEXT("active_module_name"), GetActiveModuleName());
+			StateObject->SetStringField(TEXT("generated_module_name"), GetGeneratedModuleName());
+			StateObject->SetBoolField(TEXT("has_pending_hotfix"), HasPendingHotfix());
+			StateObject->SetBoolField(TEXT("copilot_authenticated"), CopilotDeviceAuthState.bIsAuthenticated);
+			OutResultText = SerializeJsonObject(StateObject);
+			return true;
+		}
+
+		if (ToolCall.Tool == TEXT("read_project_file"))
+		{
+			FString RequestedPath;
+			if (!Args->TryGetStringField(TEXT("path"), RequestedPath) || RequestedPath.TrimStartAndEnd().IsEmpty())
+			{
+				OutResultText = TEXT("read_project_file requires a non-empty path.");
+				return false;
+			}
+
+			FString AbsolutePath;
+			if (!ResolveReadableProjectPath(FPaths::ProjectDir(), RequestedPath, AbsolutePath))
+			{
+				OutResultText = FString::Printf(TEXT("Path is not readable within project bounds: %s"), *RequestedPath);
+				return false;
+			}
+
+			FString FileContents;
+			if (!FFileHelper::LoadFileToString(FileContents, *AbsolutePath))
+			{
+				OutResultText = FString::Printf(TEXT("Failed to read file: %s"), *RequestedPath);
+				return false;
+			}
+
+			OutResultText = FString::Printf(TEXT("File: %s\n\n%s"), *RequestedPath, *TruncateForToolResult(FileContents));
+			return true;
+		}
+
+		if (ToolCall.Tool == TEXT("read_generated_hotfix"))
+		{
+			FString ModuleName;
+			Args->TryGetStringField(TEXT("module_name"), ModuleName);
+			ModuleName = NormalizeModuleName(ModuleName.IsEmpty() ? TargetModuleName : ModuleName);
+
+			const FString JsPath = GetAbsoluteScriptPathForModule(ModuleName, TEXT(".js"));
+			FString FileContents;
+			if (!FFileHelper::LoadFileToString(FileContents, *JsPath))
+			{
+				OutResultText = FString::Printf(TEXT("No generated hotfix source found at %s"), *JsPath);
+				return false;
+			}
+
+			OutResultText = FString::Printf(TEXT("Module: %s\nPath: %s\n\n%s"), *ModuleName, *JsPath, *TruncateForToolResult(FileContents));
+			return true;
+		}
+
+		if (ToolCall.Tool == TEXT("write_hotfix_file"))
+		{
+			FString ModuleName;
+			Args->TryGetStringField(TEXT("module_name"), ModuleName);
+			ModuleName = NormalizeModuleName(ModuleName.IsEmpty() ? TargetModuleName : ModuleName);
+
+			FString JavaScript;
+			if (!Args->TryGetStringField(TEXT("javascript"), JavaScript) || JavaScript.TrimStartAndEnd().IsEmpty())
+			{
+				OutResultText = TEXT("write_hotfix_file requires javascript.");
+				return false;
+			}
+
+			FString SavedModuleName;
+			FString Error;
+			if (!WriteHotfixFiles(ModuleName, JavaScript, SavedModuleName, Error))
+			{
+				OutResultText = Error;
+				return false;
+			}
+
+			FString TypeScript;
+			if (Args->TryGetStringField(TEXT("typescript"), TypeScript) && !TypeScript.TrimStartAndEnd().IsEmpty())
+			{
+				const FString TsPath = GetAbsoluteScriptPathForModule(SavedModuleName, TEXT(".ts"));
+				FFileHelper::SaveStringToFile(TypeScript, *TsPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
+			}
+
+			PendingGeneratedModuleName = SavedModuleName;
+			PendingGeneratedSource = JavaScript;
+
+			FGCAIHotfixGenerationResult Result;
+			Result.bSuccess = true;
+			Result.ModuleName = SavedModuleName;
+			Result.JavaScript = JavaScript;
+			Result.TypeScript = TypeScript.IsEmpty() ? JavaScript : TypeScript;
+			Result.Summary = TEXT("Generated hotfix code is ready.");
+			LastGeneratedResult = Result;
+			OnHotfixGenerated.Broadcast(Result);
+
+			OutResultText = FString::Printf(TEXT("Wrote pending hotfix module %s"), *SavedModuleName);
+			return true;
+		}
+
+		if (ToolCall.Tool == TEXT("apply_hotfix"))
+		{
+			if (!HasPendingHotfix())
+			{
+				OutResultText = TEXT("No pending hotfix is available to apply.");
+				return false;
+			}
+
+			if (!ApplyPendingHotfix())
+			{
+				OutResultText = TEXT("ApplyPendingHotfix returned false.");
+				return false;
+			}
+
+			OutResultText = TEXT("Pending hotfix applied successfully.");
+			return true;
+		}
+
+		if (ToolCall.Tool == TEXT("reload_hotfix"))
+		{
+			if (!ApplyPendingHotfix())
+			{
+				RestartHotfixRuntime();
+			}
+
+			OutResultText = TEXT("Hotfix runtime reload requested.");
+			return true;
+		}
+
+		OutResultText = FString::Printf(TEXT("Unknown tool: %s"), *ToolCall.Tool);
+		return false;
+	};
+
+	bool bExecutedTool = false;
+	for (const FAgentToolCall& ToolCall : AgentPayload.ToolCalls)
+	{
+		const FString ToolArgsJson = SerializeJsonObject(ToolCall.Args);
+		AppendChatMessage(TEXT("assistant"), ToolArgsJson, TEXT("tool_call"), ToolCall.Tool);
+
+		FString ToolResultText;
+		const bool bToolSucceeded = ExecuteToolCall(ToolCall, ToolResultText);
+		AppendChatMessage(TEXT("tool"), TruncateForToolResult(ToolResultText), TEXT("tool_result"), ToolCall.Tool);
+		bExecutedTool = true;
+
+		if (!bToolSucceeded)
+		{
+			EmitRuntimeLog(FString::Printf(TEXT("Agent tool %s failed: %s"), *ToolCall.Tool, *ToolResultText));
+		}
+	}
+
+	if (!bExecutedTool || AgentPayload.bDone)
+	{
+		return;
+	}
+
+	if (RemainingSteps <= 1)
+	{
+		AppendChatMessage(TEXT("assistant"), TEXT("本轮工具执行已经达到上限。继续发消息可以开始下一轮。"));
+		return;
+	}
+
+	BeginAgentTurnWithConfiguredProvider(TargetModuleName, RemainingSteps - 1);
 }
 
-bool UGCAIHotReloadSubsystem::TryParseGenerationResponse(const FString& ResponseText, FGCAIHotfixGenerationResult& OutResult) const
+bool UGCAIHotReloadSubsystem::TryExtractAssistantText(const FString& ResponseText, FString& OutContent) const
 {
 	TSharedPtr<FJsonObject> Root;
 	TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(ResponseText);
@@ -949,9 +1258,7 @@ bool UGCAIHotReloadSubsystem::TryParseGenerationResponse(const FString& Response
 		return false;
 	}
 
-	FString Content;
-
-	if (!Root->TryGetStringField(TEXT("output_text"), Content) || Content.IsEmpty())
+	if (!Root->TryGetStringField(TEXT("output_text"), OutContent) || OutContent.IsEmpty())
 	{
 		const TArray<TSharedPtr<FJsonValue>>* OutputItems = nullptr;
 		if (Root->TryGetArrayField(TEXT("output"), OutputItems) && OutputItems)
@@ -987,14 +1294,14 @@ bool UGCAIHotReloadSubsystem::TryParseGenerationResponse(const FString& Response
 					FString PartText;
 					if ((*ContentObject)->TryGetStringField(TEXT("text"), PartText) && !PartText.IsEmpty())
 					{
-						Content += PartText;
+						OutContent += PartText;
 					}
 				}
 			}
 		}
 	}
 
-	if (Content.IsEmpty())
+	if (OutContent.IsEmpty())
 	{
 		const TArray<TSharedPtr<FJsonValue>>* Choices = nullptr;
 		if (!Root->TryGetArrayField(TEXT("choices"), Choices) || !Choices || Choices->Num() == 0)
@@ -1014,10 +1321,21 @@ bool UGCAIHotReloadSubsystem::TryParseGenerationResponse(const FString& Response
 			return false;
 		}
 
-		if (!(*MessageObject)->TryGetStringField(TEXT("content"), Content))
+		if (!(*MessageObject)->TryGetStringField(TEXT("content"), OutContent))
 		{
 			return false;
 		}
+	}
+
+	return !OutContent.IsEmpty();
+}
+
+bool UGCAIHotReloadSubsystem::TryParseGenerationResponse(const FString& ResponseText, FGCAIHotfixGenerationResult& OutResult) const
+{
+	FString Content;
+	if (!TryExtractAssistantText(ResponseText, Content))
+	{
+		return false;
 	}
 
 	TSharedPtr<FJsonObject> Payload;
