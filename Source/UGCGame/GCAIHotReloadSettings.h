@@ -25,6 +25,23 @@ public:
 	UPROPERTY(EditAnywhere, Config, Category = "AI")
 	FGCAIProviderConfig DefaultProvider;
 
+	// Approximate token budget for agent memory before old steps are folded
+	// into an LLM-generated summary.
+	UPROPERTY(EditAnywhere, Config, Category = "Agent")
+	int32 ContextTokenBudget = 24000;
+
+	// Max model turns per user task (each turn may carry several tool calls).
+	UPROPERTY(EditAnywhere, Config, Category = "Agent")
+	int32 MaxAgentSteps = 24;
+
+	// Recent memory steps that are never compacted away.
+	UPROPERTY(EditAnywhere, Config, Category = "Agent")
+	int32 CompactionKeepRecentSteps = 12;
+
+	// Persist agent memory to Saved/AI/Sessions so conversations survive restarts.
+	UPROPERTY(EditAnywhere, Config, Category = "Agent")
+	bool bPersistAgentSession = true;
+
 	UPROPERTY(EditAnywhere, Config, Category = "AI", meta=(MultiLine=true))
 	FString SystemPrompt = TEXT(
 		"You generate Unreal puerts hotfix modules. "

@@ -13,8 +13,14 @@ class AGCAIHotReloadPlayerController : public APlayerController
 
 public:
 	virtual void BeginPlay() override;
+	virtual void SetupInputComponent() override;
 
 private:
+	void ToggleChat();
+	void SetChatVisible(bool bVisible);
+
 	UPROPERTY(Transient)
 	TObjectPtr<UGCAIHotReloadChatWidget> ChatWidget;
+
+	bool bChatVisible = false;
 };

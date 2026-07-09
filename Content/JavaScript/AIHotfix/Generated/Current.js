@@ -1,30 +1,35 @@
 const { argv } = require('puerts');
 const bridge = argv.getByName('Bridge');
 
-function getAccessibleInterfaces() {
-  const api = {
-    Bridge: {
-      LogMessage: typeof bridge.LogMessage === 'function',
-      EmitGameplayCommand: typeof bridge.EmitGameplayCommand === 'function',
-      GetWorldSeconds: typeof bridge.GetWorldSeconds === 'function',
-      GetActiveModuleName: typeof bridge.GetActiveModuleName === 'function',
-    },
-    Notes: [
-      '本模块按约束仅使用 Bridge 提供的安全接口。',
-      '如需更多能力，请在游戏侧扩展 Bridge 并通过 argv.getByName(\'Bridge\') 暴露。'
-    ]
-  };
-  return api;
+// Make Buddy circle around the tower at (-800,0,600)
+const cx = -800, cy = 0, cz = 600, radius = 300;
+const stepsPerLap = 16;          // waypoints per full circle
+const intervalMs = 900;          // time between waypoints
+
+if (globalThis.__circleTimer) {
+  clearInterval(globalThis.__circleTimer);
+  globalThis.__circleTimer = null;
+}
+globalThis.__circleStep = globalThis.__circleStep || 0;
+
+function sendWaypoint() {
+  const i = globalThis.__circleStep % stepsPerLap;
+  const ang = (i / stepsPerLap) * Math.PI * 2;
+  const x = cx + radius * Math.cos(ang);
+  const y = cy + radius * Math.sin(ang);
+  try {
+    bridge.EmitGameplayCommand('CommandTeammate', JSON.stringify({
+      teammate: 'Buddy',
+      action: 'move_to',
+      x: x, y: y, z: cz,
+    }));
+  } catch (e) {
+    bridge.LogMessage('circle waypoint error: ' + e);
+  }
+  globalThis.__circleStep++;
 }
 
-function printAccessibleInterfaces() {
-  const moduleName = (bridge.GetActiveModuleName && bridge.GetActiveModuleName()) || 'UnknownModule';
-  const t = (bridge.GetWorldSeconds && bridge.GetWorldSeconds()) || 0;
-  const api = getAccessibleInterfaces();
-  bridge.LogMessage(`[${moduleName}] 可访问接口(安全白名单) @t=${t}: ` + JSON.stringify(api.Bridge));
-}
-
-// Run on module load
-printAccessibleInterfaces();
-
-module.exports = { getAccessibleInterfaces, printAccessibleInterfaces };
+sendWaypoint();
+globalThis.__circleTimer = setInterval(sendWaypoint, intervalMs);
+bridge.LogMessage('Buddy circling tower hotfix live');
+'circle loop started';

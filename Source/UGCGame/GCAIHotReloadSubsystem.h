@@ -3,10 +3,10 @@
 #include "CoreMinimal.h"
 #include "JsEnv.h"
 #include "Subsystems/GameInstanceSubsystem.h"
-#include "Interfaces/IHttpRequest.h"
 #include "GCAIHotReloadTypes.h"
 #include "GCAIHotReloadSubsystem.generated.h"
 
+class UGCAgentKernel;
 class UGCAIHotfixBridge;
 
 UCLASS(BlueprintType)
@@ -49,10 +49,7 @@ public:
 	void SendAgentPrompt(const FString& Prompt, const FString& ModuleName);
 
 	UFUNCTION(BlueprintCallable, Category = "UGC|AI Hotfix")
-	void BeginCopilotDeviceLogin();
-
-	UFUNCTION(BlueprintCallable, Category = "UGC|AI Hotfix")
-	void CancelCopilotDeviceLogin();
+	void ResetChatSession();
 
 	UFUNCTION(BlueprintPure, Category = "UGC|AI Hotfix")
 	FString GetHotfixDirectoryOnDisk() const;
@@ -69,8 +66,8 @@ public:
 	UFUNCTION(BlueprintPure, Category = "UGC|AI Hotfix")
 	TArray<FGCAIChatMessage> GetChatMessages() const;
 
-	UFUNCTION(BlueprintPure, Category = "UGC|AI Hotfix")
-	FGCAICopilotDeviceAuthState GetCopilotDeviceAuthState() const;
+	// Hotfix module the resident AgentRuntime.js should require() on boot.
+	FString GetBootHotfixModuleName() const;
 
 	void EmitGameplayCommand(const FString& CommandName, const FString& PayloadJson);
 	void EmitRuntimeLog(const FString& Message);
@@ -93,37 +90,30 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "UGC|AI Hotfix")
 	FGCAIHotfixSimpleDelegate OnChatSessionChanged;
 
-	UPROPERTY(BlueprintAssignable, Category = "UGC|AI Hotfix")
-	FGCAICopilotDeviceAuthUpdatedDelegate OnCopilotDeviceAuthUpdated;
-
 private:
 	void ShutdownJsEnv();
-	bool StartJsEnvForModule(const FString& ModuleName, FString& OutError);
+	bool StartAgentJsRuntime(FString& OutError);
 	bool WriteHotfixFiles(const FString& ModuleName, const FString& SourceCode, FString& OutModuleName, FString& OutError) const;
 	FString NormalizeModuleName(const FString& ProposedName) const;
 	FString GetAbsoluteScriptPathForModule(const FString& ModuleName, const FString& Extension) const;
 	FString BuildAgentSystemPrompt() const;
-	void BeginAgentTurnWithConfiguredProvider(const FString& NormalizedModuleName, int32 RemainingSteps);
-	void BeginAgentTurn(const FString& NormalizedModuleName, const FString& BaseUrl, const FString& AuthToken, int32 RemainingSteps);
+
+	void ConfigureKernel();
+	void RegisterKernelTools();
+	void StartKernelTask(const FString& Prompt);
+
+	void HandleKernelAssistantDelta(const FString& Text);
+	void HandleKernelAssistantMessage(const FString& Text);
+	void HandleKernelToolEvent(const FString& ToolName, const FString& Payload, bool bIsResult);
+	void HandleKernelRunFinished(bool bSuccess, const FString& FinalTextOrError);
+
 	void AppendChatMessage(const FString& Role, const FString& Content, const FString& Kind = TEXT("message"), const FString& Title = FString());
+	void UpdateStreamingAssistantMessage(const FString& Content);
 	void BroadcastChatSessionChanged();
-	void BroadcastCopilotDeviceAuthUpdated();
-	void ScheduleCopilotDeviceTokenPoll(float DelaySeconds);
-	void ResetCopilotDeviceLogin(bool bKeepAuthenticatedState);
 	void LoadProviderConfigCache();
 	void SaveProviderConfigCache() const;
 	FString GetProviderConfigCachePath() const;
-	void HandleCopilotDeviceCodeResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bWasSuccessful);
-	void HandleCopilotDeviceAccessTokenResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bWasSuccessful);
-	void HandleCopilotTokenResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bWasSuccessful, FString TargetModuleName, int32 RemainingSteps);
-	void HandleAgentTurnResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bWasSuccessful, FString TargetModuleName, int32 RemainingSteps);
-	bool TryParseGenerationResponse(const FString& ResponseText, FGCAIHotfixGenerationResult& OutResult) const;
-	bool TryExtractAssistantText(const FString& ResponseText, FString& OutContent) const;
-	bool TryParseCopilotDeviceCodeResponse(const FString& ResponseText, FGCAICopilotDeviceAuthState& OutState, FString& OutDeviceCode) const;
-	bool TryParseCopilotDeviceAccessTokenResponse(const FString& ResponseText, FString& OutAccessToken, FString& OutErrorCode, FString& OutErrorDescription, int32& OutIntervalSeconds) const;
-	bool TryParseCopilotTokenResponse(const FString& ResponseText, FString& OutToken, FString& OutBaseUrl, int64& OutExpiresAtUnixMs) const;
-	static FString ExtractFirstCodeBlock(const FString& Text);
-	static FString DeriveCopilotBaseUrlFromToken(const FString& Token);
+	FString GetAgentSessionFilePath() const;
 
 	FGCAIProviderConfig ProviderConfig;
 	TUniquePtr<PUERTS_NAMESPACE::FJsEnv> JsEnv;
@@ -131,14 +121,14 @@ private:
 	UPROPERTY(Transient)
 	TObjectPtr<UGCAIHotfixBridge> Bridge;
 
+	UPROPERTY(Transient)
+	TObjectPtr<UGCAgentKernel> Kernel;
+
 	FString ActiveModuleName;
-	TSharedPtr<IHttpRequest, ESPMode::ThreadSafe> PendingGenerationRequest;
-	TSharedPtr<IHttpRequest, ESPMode::ThreadSafe> PendingCopilotAuthRequest;
+	FString BootHotfixModuleName;
+	FString CurrentTargetModuleName;
 	FString PendingGeneratedModuleName;
 	FString PendingGeneratedSource;
 	FGCAIHotfixGenerationResult LastGeneratedResult;
 	TArray<FGCAIChatMessage> ChatMessages;
-	FGCAICopilotDeviceAuthState CopilotDeviceAuthState;
-	FString PendingCopilotDeviceCode;
-	FTimerHandle CopilotDevicePollTimer;
 };

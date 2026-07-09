@@ -52,7 +52,7 @@ TSharedPtr<FJsonObject> FBPVariables::CreateVariable(const TSharedPtr<FJsonObjec
 
         if (Params->HasField(TEXT("default_value")))
         {
-            SetDefaultValue(Variable, Params->Values.FindRef("default_value"));
+            SetDefaultValue(Variable, Params->Values.FindRef(TEXT("default_value")));
         }
 
         Blueprint->MarkPackageDirty();
@@ -289,7 +289,7 @@ TSharedPtr<FJsonObject> FBPVariables::SetVariableProperties(const TSharedPtr<FJs
     // Update default_value
     if (Params->HasField(TEXT("default_value")))
     {
-        SetDefaultValue(*VarDesc, Params->Values.FindRef("default_value"));
+        SetDefaultValue(*VarDesc, Params->Values.FindRef(TEXT("default_value")));
         UpdatedProperties->SetStringField("default_value", "updated");
     }
 

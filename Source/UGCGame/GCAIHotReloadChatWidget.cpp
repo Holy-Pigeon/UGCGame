@@ -1,77 +1,237 @@
 #include "GCAIHotReloadChatWidget.h"
 
-#include "Dom/JsonObject.h"
-#include "Framework/Application/SlateApplication.h"
+#include "Engine/GameInstance.h"
 #include "GCAIHotReloadSubsystem.h"
-#include "GCAIHotReloadTypes.h"
-#include "IWebBrowserWindow.h"
-#include "Misc/FileHelper.h"
-#include "Misc/Paths.h"
-#include "Policies/CondensedJsonPrintPolicy.h"
-#include "SWebBrowser.h"
-#include "Serialization/JsonSerializer.h"
-#include "Serialization/JsonWriter.h"
+#include "Styling/CoreStyle.h"
+#include "Widgets/Input/SButton.h"
+#include "Widgets/Input/SEditableTextBox.h"
+#include "Widgets/Input/SMultiLineEditableTextBox.h"
+#include "Widgets/Layout/SBorder.h"
+#include "Widgets/Layout/SBox.h"
+#include "Widgets/Layout/SScrollBox.h"
+#include "Widgets/SBoxPanel.h"
+#include "Widgets/SOverlay.h"
+#include "Widgets/Text/STextBlock.h"
+
+#define LOCTEXT_NAMESPACE "GCAIChat"
 
 namespace
 {
-const FString DefaultCopilotModel = TEXT("gpt-5.2");
-const FString DefaultModuleName = TEXT("AIHotfix/Generated/Current");
-const TCHAR* BrowserCommandPrefix = TEXT("__UGC_HOTFIX__");
-const TCHAR* HtmlCssPlaceholder = TEXT("__AI_HOTFIX_CSS__");
-const TCHAR* HtmlJsPlaceholder = TEXT("__AI_HOTFIX_JS__");
+const FString DefaultModelName = TEXT("claude-opus-4-8");
 
-FString MakeAuthSummary(const FGCAICopilotDeviceAuthState& State)
+FSlateFontInfo BodyFont(int32 Size)
 {
-	if (State.bIsAuthenticated)
+	return FCoreStyle::GetDefaultFontStyle("Regular", Size);
+}
+
+FSlateFontInfo BoldFont(int32 Size)
+{
+	return FCoreStyle::GetDefaultFontStyle("Bold", Size);
+}
+
+FText RoleLabelFor(const FGCAIChatMessage& Message)
+{
+	if (Message.Kind == TEXT("tool_call"))
 	{
-		return TEXT("GitHub connected");
+		return FText::FromString(FString::Printf(TEXT("工具调用 · %s"), *Message.Title));
 	}
-
-	if (State.bIsPending)
+	if (Message.Kind == TEXT("tool_result"))
 	{
-		return TEXT("Waiting for GitHub approval");
+		return FText::FromString(FString::Printf(TEXT("工具结果 · %s"), *Message.Title));
 	}
-
-	return TEXT("GitHub not connected");
-}
-
-void AddStringArray(TSharedRef<FJsonObject> RootObject, const TCHAR* FieldName, const TArray<FString>& Values)
-{
-	TArray<TSharedPtr<FJsonValue>> JsonValues;
-	JsonValues.Reserve(Values.Num());
-	for (const FString& Value : Values)
+	if (Message.Role == TEXT("user"))
 	{
-		JsonValues.Add(MakeShared<FJsonValueString>(Value));
+		return LOCTEXT("RoleYou", "你");
 	}
-
-	RootObject->SetArrayField(FieldName, JsonValues);
+	if (Message.Role == TEXT("assistant"))
+	{
+		return LOCTEXT("RoleAI", "AI");
+	}
+	return LOCTEXT("RoleSystem", "系统");
 }
 
-FString GetWebUiAssetPath(const TCHAR* FileName)
+FString ClampForDisplay(const FString& Text, int32 MaxChars)
 {
-	return FPaths::Combine(FPaths::ProjectContentDir(), TEXT("UI/AIHotfixWeb"), FileName);
+	if (Text.Len() <= MaxChars)
+	{
+		return Text;
+	}
+	return Text.Left(MaxChars) + FString::Printf(TEXT("\n…（省略 %d 字）"), Text.Len() - MaxChars);
+}
 }
 
-bool LoadWebUiAsset(const TCHAR* FileName, FString& OutContents)
+TSharedRef<SWidget> UGCAIHotReloadChatWidget::RebuildWidget()
 {
-	return FFileHelper::LoadFileToString(OutContents, *GetWebUiAssetPath(FileName));
-}
+	PanelBrush = FSlateColorBrush(FLinearColor(0.035f, 0.05f, 0.085f, 0.97f));
+	HeaderBrush = FSlateColorBrush(FLinearColor(0.09f, 0.12f, 0.19f, 1.0f));
+	UserBubbleBrush = FSlateColorBrush(FLinearColor(0.14f, 0.26f, 0.46f, 1.0f));
+	AssistantBubbleBrush = FSlateColorBrush(FLinearColor(0.12f, 0.14f, 0.2f, 1.0f));
+	ToolBubbleBrush = FSlateColorBrush(FLinearColor(0.13f, 0.17f, 0.12f, 1.0f));
 
-FString BuildMissingAssetDocument()
-{
-	return TEXT(
-		"<html><body style=\"margin:0;padding:24px;font-family:Segoe UI,sans-serif;background:#0b1320;color:#eef4ff;\">"
-		"<h2 style=\"margin:0 0 12px;\">AI Hotfix UI assets are missing</h2>"
-		"<p style=\"margin:0;line-height:1.6;\">Expected files under Content/UI/AIHotfixWeb: index.html, styles.css, app.js.</p>"
-		"</body></html>");
-}
+	const FLinearColor SubtleText(0.62f, 0.68f, 0.78f, 1.0f);
+
+	return SNew(SOverlay)
+		+ SOverlay::Slot()
+		.HAlign(HAlign_Right)
+		.VAlign(VAlign_Fill)
+		[
+			SNew(SBox)
+			.WidthOverride(500.0f)
+			[
+				SNew(SBorder)
+				.BorderImage(&PanelBrush)
+				.Padding(FMargin(14.0f))
+				[
+					SNew(SVerticalBox)
+
+					// Header
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(0.0f, 0.0f, 0.0f, 8.0f)
+					[
+						SNew(SBorder)
+						.BorderImage(&HeaderBrush)
+						.Padding(FMargin(12.0f, 8.0f))
+						[
+							SNew(SVerticalBox)
+							+ SVerticalBox::Slot().AutoHeight()
+							[
+								SNew(STextBlock)
+								.Text(LOCTEXT("Title", "AI 助手 · 实时指挥"))
+								.Font(BoldFont(15))
+								.ColorAndOpacity(FSlateColor(FLinearColor::White))
+							]
+							+ SVerticalBox::Slot().AutoHeight().Padding(0.0f, 3.0f, 0.0f, 0.0f)
+							[
+								SAssignNew(StatusText, STextBlock)
+								.Text(LOCTEXT("StatusReady", "Ready"))
+								.Font(BodyFont(9))
+								.ColorAndOpacity(FSlateColor(SubtleText))
+							]
+						]
+					]
+
+					// Base URL row (Anthropic / cc-switch relay)
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(0.0f, 0.0f, 0.0f, 5.0f)
+					[
+						SAssignNew(BaseUrlInput, SEditableTextBox)
+						.HintText(LOCTEXT("BaseUrlHint", "Base URL（cc-switch / Anthropic 地址，如 https://...，必填）"))
+						.Font(BodyFont(9))
+					]
+
+					// Auth / config row
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(0.0f, 0.0f, 0.0f, 6.0f)
+					[
+						SNew(SHorizontalBox)
+						+ SHorizontalBox::Slot().FillWidth(1.0f).Padding(0.0f, 0.0f, 6.0f, 0.0f)
+						[
+							SAssignNew(TokenInput, SEditableTextBox)
+							.IsPassword(true)
+							.HintText(LOCTEXT("TokenHint", "API Token（cc-switch / Anthropic 的 auth token）"))
+							.Font(BodyFont(9))
+						]
+						+ SHorizontalBox::Slot().AutoWidth().Padding(0.0f, 0.0f, 6.0f, 0.0f)
+						[
+							SNew(SBox).WidthOverride(140.0f)
+							[
+								SAssignNew(ModelInput, SEditableTextBox)
+								.Text(FText::FromString(DefaultModelName))
+								.HintText(LOCTEXT("ModelHint", "model"))
+								.Font(BodyFont(9))
+							]
+						]
+						+ SHorizontalBox::Slot().AutoWidth()
+						[
+							SNew(SButton)
+							.Text(LOCTEXT("Reset", "清空"))
+							.OnClicked(FOnClicked::CreateUObject(this, &UGCAIHotReloadChatWidget::OnResetClicked))
+						]
+					]
+
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(0.0f, 0.0f, 0.0f, 8.0f)
+					[
+						SAssignNew(AuthText, STextBlock)
+						.Text(LOCTEXT("AuthHint", "填 Base URL + Token + model，例如 cc-switch 的地址与 auth token。"))
+						.Font(BodyFont(9))
+						.ColorAndOpacity(FSlateColor(SubtleText))
+						.AutoWrapText(true)
+					]
+
+					// Messages
+					+ SVerticalBox::Slot()
+					.FillHeight(1.0f)
+					.Padding(0.0f, 0.0f, 0.0f, 8.0f)
+					[
+						SNew(SBorder)
+						.BorderImage(&HeaderBrush)
+						.Padding(FMargin(6.0f))
+						[
+							SAssignNew(MessageScrollBox, SScrollBox)
+							.Orientation(Orient_Vertical)
+						]
+					]
+
+					// Runtime log
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(0.0f, 0.0f, 0.0f, 8.0f)
+					[
+						SNew(SBox).HeightOverride(52.0f)
+						[
+							SNew(SScrollBox)
+							.Orientation(Orient_Vertical)
+							+ SScrollBox::Slot()
+							[
+								SAssignNew(RuntimeLogText, STextBlock)
+								.Text(LOCTEXT("NoRuntime", "No runtime events yet."))
+								.Font(BodyFont(8))
+								.ColorAndOpacity(FSlateColor(SubtleText))
+								.AutoWrapText(true)
+							]
+						]
+					]
+
+					// Composer
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					[
+						SNew(SHorizontalBox)
+						+ SHorizontalBox::Slot().FillWidth(1.0f).Padding(0.0f, 0.0f, 6.0f, 0.0f)
+						[
+							SNew(SBox).MinDesiredHeight(48.0f)
+							[
+								SAssignNew(PromptInput, SMultiLineEditableTextBox)
+								.HintText(LOCTEXT("PromptHint", "描述你想让 AI 做的事，例如：造座房子、放个药包、让队友去捡了再躲起来。"))
+								.Font(BodyFont(10))
+								.OnTextCommitted(FOnTextCommitted::CreateUObject(this, &UGCAIHotReloadChatWidget::OnPromptCommitted))
+							]
+						]
+						+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Fill)
+						[
+							SNew(SBox).WidthOverride(72.0f)
+							[
+								SAssignNew(SendButton, SButton)
+								.HAlign(HAlign_Center)
+								.VAlign(VAlign_Center)
+								.Text(LOCTEXT("Send", "发送"))
+								.OnClicked(FOnClicked::CreateUObject(this, &UGCAIHotReloadChatWidget::OnSendClicked))
+							]
+						]
+					]
+				]
+			]
+		];
 }
 
 void UGCAIHotReloadChatWidget::NativeConstruct()
 {
 	Super::NativeConstruct();
-
-	LoadBrowserDocument();
 
 	if (UGCAIHotReloadSubsystem* Subsystem = GetHotReloadSubsystem())
 	{
@@ -80,10 +240,24 @@ void UGCAIHotReloadChatWidget::NativeConstruct()
 		Subsystem->OnHotfixApplied.AddDynamic(this, &UGCAIHotReloadChatWidget::HandleHotfixApplied);
 		Subsystem->OnHotfixFailed.AddDynamic(this, &UGCAIHotReloadChatWidget::HandleHotfixFailed);
 		Subsystem->OnHotfixGenerated.AddDynamic(this, &UGCAIHotReloadChatWidget::HandleHotfixGenerated);
-		Subsystem->OnCopilotDeviceAuthUpdated.AddDynamic(this, &UGCAIHotReloadChatWidget::HandleCopilotDeviceAuthUpdated);
+
+		bIsGenerating = Subsystem->IsAgentTurnRunning();
+
+		const FGCAIProviderConfig ProviderConfig = Subsystem->GetProviderConfig();
+		if (ModelInput.IsValid() && !ProviderConfig.Model.IsEmpty())
+		{
+			ModelInput->SetText(FText::FromString(ProviderConfig.Model));
+		}
+		// Prefill the saved base URL so the connection is remembered across runs.
+		if (BaseUrlInput.IsValid() && !ProviderConfig.BaseUrl.IsEmpty())
+		{
+			BaseUrlInput->SetText(FText::FromString(ProviderConfig.BaseUrl));
+		}
 	}
 
-	RefreshFromSubsystem();
+	RefreshMessages();
+	RefreshStatus();
+	RefreshRuntimeLog();
 }
 
 void UGCAIHotReloadChatWidget::NativeDestruct()
@@ -95,7 +269,6 @@ void UGCAIHotReloadChatWidget::NativeDestruct()
 		Subsystem->OnHotfixApplied.RemoveAll(this);
 		Subsystem->OnHotfixFailed.RemoveAll(this);
 		Subsystem->OnHotfixGenerated.RemoveAll(this);
-		Subsystem->OnCopilotDeviceAuthUpdated.RemoveAll(this);
 	}
 
 	Super::NativeDestruct();
@@ -103,218 +276,157 @@ void UGCAIHotReloadChatWidget::NativeDestruct()
 
 void UGCAIHotReloadChatWidget::ReleaseSlateResources(bool bReleaseChildren)
 {
+	MessageScrollBox.Reset();
+	BaseUrlInput.Reset();
+	TokenInput.Reset();
+	ModelInput.Reset();
+	PromptInput.Reset();
+	StatusText.Reset();
+	AuthText.Reset();
+	RuntimeLogText.Reset();
+	SendButton.Reset();
+
 	Super::ReleaseSlateResources(bReleaseChildren);
-	BrowserWidget.Reset();
-	bBrowserReady = false;
-}
-
-TSharedRef<SWidget> UGCAIHotReloadChatWidget::RebuildWidget()
-{
-	SAssignNew(BrowserWidget, SWebBrowser)
-		.InitialURL(TEXT("about:blank"))
-		.ShowControls(false)
-		.ShowAddressBar(false)
-		.ShowErrorMessage(true)
-		.SupportsTransparency(true)
-		.BackgroundColor(FColor(9, 12, 18, 0))
-		.OnLoadCompleted(FSimpleDelegate::CreateUObject(this, &UGCAIHotReloadChatWidget::HandleBrowserLoadCompleted))
-		.OnConsoleMessage(FOnConsoleMessageDelegate::CreateUObject(this, &UGCAIHotReloadChatWidget::HandleBrowserConsoleMessage));
-
-	BrowserWidget->BindUObject(TEXT("bridge"), this, true);
-	LoadBrowserDocument();
-
-	return BrowserWidget.ToSharedRef();
-}
-
-void UGCAIHotReloadChatWidget::RefreshFromSubsystem()
-{
-	if (UGCAIHotReloadSubsystem* Subsystem = GetHotReloadSubsystem())
-	{
-		const FGCAIProviderConfig ProviderConfig = Subsystem->GetProviderConfig();
-		if (DraftModel.IsEmpty())
-		{
-			DraftModel = ProviderConfig.Model.IsEmpty() ? DefaultCopilotModel : ProviderConfig.Model;
-		}
-
-		if (DraftModuleName.IsEmpty())
-		{
-			DraftModuleName = Subsystem->GetGeneratedModuleName();
-		}
-
-		CopilotDeviceAuthState = Subsystem->GetCopilotDeviceAuthState();
-		bIsGenerating = Subsystem->IsAgentTurnRunning();
-	}
-
-	SyncBrowserState(true);
-}
-
-void UGCAIHotReloadChatWidget::SyncBrowserState(bool bHydrateInputs)
-{
-	if (!bBrowserReady || !BrowserWidget.IsValid())
-	{
-		return;
-	}
-
-	PushBrowserState(bHydrateInputs);
-}
-
-void UGCAIHotReloadChatWidget::PushBrowserState(bool bHydrateInputs)
-{
-	if (!BrowserWidget.IsValid())
-	{
-		return;
-	}
-
-	const FString PageStateJson = BuildPageStateJson(bHydrateInputs);
-	BrowserWidget->ExecuteJavascript(
-		FString::Printf(TEXT("window.ugcHotfix && window.ugcHotfix.applyState(%s);"), *PageStateJson));
 }
 
 UGCAIHotReloadSubsystem* UGCAIHotReloadChatWidget::GetHotReloadSubsystem() const
 {
-	if (!GetGameInstance())
+	if (const UGameInstance* GameInstance = GetGameInstance())
 	{
-		return nullptr;
+		return GameInstance->GetSubsystem<UGCAIHotReloadSubsystem>();
 	}
-
-	return GetGameInstance()->GetSubsystem<UGCAIHotReloadSubsystem>();
+	return nullptr;
 }
 
-FString UGCAIHotReloadChatWidget::BuildPageStateJson(bool bHydrateInputs) const
+TSharedRef<SWidget> UGCAIHotReloadChatWidget::BuildMessageEntry(const FGCAIChatMessage& Message) const
 {
-	TSharedRef<FJsonObject> RootObject = MakeShared<FJsonObject>();
-	RootObject->SetBoolField(TEXT("hydrateInputs"), bHydrateInputs);
-	RootObject->SetStringField(TEXT("statusText"), StatusMessage);
-	RootObject->SetBoolField(TEXT("isGenerating"), bIsGenerating);
+	const bool bIsUser = Message.Role == TEXT("user");
+	const bool bIsTool = Message.Kind == TEXT("tool_call") || Message.Kind == TEXT("tool_result");
 
-	if (const UGCAIHotReloadSubsystem* Subsystem = GetHotReloadSubsystem())
+	const FSlateBrush* BubbleBrush = bIsUser ? &UserBubbleBrush : (bIsTool ? &ToolBubbleBrush : &AssistantBubbleBrush);
+	const int32 DisplayLimit = bIsTool ? 700 : 4000;
+
+	return SNew(SBorder)
+		.BorderImage(BubbleBrush)
+		.Padding(FMargin(10.0f, 7.0f))
+		[
+			SNew(SVerticalBox)
+			+ SVerticalBox::Slot().AutoHeight().Padding(0.0f, 0.0f, 0.0f, 3.0f)
+			[
+				SNew(STextBlock)
+				.Text(RoleLabelFor(Message))
+				.Font(BoldFont(8))
+				.ColorAndOpacity(FSlateColor(FLinearColor(0.72f, 0.78f, 0.88f, 1.0f)))
+			]
+			+ SVerticalBox::Slot().AutoHeight()
+			[
+				SNew(STextBlock)
+				.Text(FText::FromString(ClampForDisplay(Message.Content, DisplayLimit)))
+				.Font(BodyFont(bIsTool ? 9 : 10))
+				.ColorAndOpacity(FSlateColor(FLinearColor(0.94f, 0.96f, 1.0f, 1.0f)))
+				.AutoWrapText(true)
+			]
+		];
+}
+
+void UGCAIHotReloadChatWidget::RefreshMessages()
+{
+	if (!MessageScrollBox.IsValid())
 	{
-		RootObject->SetBoolField(TEXT("hasPendingHotfix"), Subsystem->HasPendingHotfix());
+		return;
+	}
 
-		TArray<TSharedPtr<FJsonValue>> ChatMessageValues;
-		const TArray<FGCAIChatMessage> ChatMessages = Subsystem->GetChatMessages();
-		ChatMessageValues.Reserve(ChatMessages.Num());
-		for (const FGCAIChatMessage& ChatMessage : ChatMessages)
+	MessageScrollBox->ClearChildren();
+
+	const UGCAIHotReloadSubsystem* Subsystem = GetHotReloadSubsystem();
+	const TArray<FGCAIChatMessage> Messages = Subsystem ? Subsystem->GetChatMessages() : TArray<FGCAIChatMessage>();
+
+	if (Messages.Num() == 0)
+	{
+		MessageScrollBox->AddSlot().Padding(4.0f)
+		[
+			SNew(STextBlock)
+			.Text(LOCTEXT("Welcome", "先说出你想做的事。例如：\n· 在我面前造一座塔\n· 放一个药包，让队友去捡\n· 让队友躲到房子后面"))
+			.Font(BodyFont(10))
+			.ColorAndOpacity(FSlateColor(FLinearColor(0.6f, 0.66f, 0.76f, 1.0f)))
+			.AutoWrapText(true)
+		];
+		return;
+	}
+
+	for (const FGCAIChatMessage& Message : Messages)
+	{
+		MessageScrollBox->AddSlot().Padding(0.0f, 0.0f, 0.0f, 6.0f)
+		[
+			BuildMessageEntry(Message)
+		];
+	}
+
+	MessageScrollBox->ScrollToEnd();
+}
+
+void UGCAIHotReloadChatWidget::RefreshStatus()
+{
+	if (StatusText.IsValid())
+	{
+		const FString Suffix = bIsGenerating ? TEXT(" · 运行中…") : FString();
+		StatusText->SetText(FText::FromString(StatusMessage + Suffix));
+	}
+
+	if (SendButton.IsValid())
+	{
+		SendButton->SetEnabled(!bIsGenerating);
+	}
+
+	if (AuthText.IsValid())
+	{
+		FString AuthLine = TEXT("填 Base URL + Token + model，例如 cc-switch 的地址与 auth token。");
+		if (const UGCAIHotReloadSubsystem* Subsystem = GetHotReloadSubsystem())
 		{
-			TSharedRef<FJsonObject> ChatMessageObject = MakeShared<FJsonObject>();
-			ChatMessageObject->SetStringField(TEXT("role"), ChatMessage.Role);
-			ChatMessageObject->SetStringField(TEXT("content"), ChatMessage.Content);
-			ChatMessageObject->SetStringField(TEXT("kind"), ChatMessage.Kind);
-			ChatMessageObject->SetStringField(TEXT("title"), ChatMessage.Title);
-			ChatMessageValues.Add(MakeShared<FJsonValueObject>(ChatMessageObject));
+			const FGCAIProviderConfig Config = Subsystem->GetProviderConfig();
+			if (!Config.BaseUrl.IsEmpty() && !Config.ApiKey.IsEmpty())
+			{
+				AuthLine = FString::Printf(TEXT("已配置：%s · %s"), *Config.BaseUrl, *Config.Model);
+			}
 		}
-		RootObject->SetArrayField(TEXT("messages"), ChatMessageValues);
+		AuthText->SetText(FText::FromString(AuthLine));
 	}
-	else
-	{
-		RootObject->SetBoolField(TEXT("hasPendingHotfix"), false);
-		RootObject->SetArrayField(TEXT("messages"), TArray<TSharedPtr<FJsonValue>>());
-	}
-
-	AddStringArray(RootObject, TEXT("runtimeLines"), RuntimeLines);
-
-	TSharedRef<FJsonObject> AuthObject = MakeShared<FJsonObject>();
-	AuthObject->SetBoolField(TEXT("isAuthenticated"), CopilotDeviceAuthState.bIsAuthenticated);
-	AuthObject->SetBoolField(TEXT("isPending"), CopilotDeviceAuthState.bIsPending);
-	AuthObject->SetStringField(TEXT("summary"), MakeAuthSummary(CopilotDeviceAuthState));
-	AuthObject->SetStringField(TEXT("statusMessage"), CopilotDeviceAuthState.StatusMessage);
-	AuthObject->SetStringField(TEXT("userCode"), CopilotDeviceAuthState.UserCode);
-	AuthObject->SetStringField(TEXT("verificationUri"), CopilotDeviceAuthState.VerificationUri);
-	AuthObject->SetStringField(TEXT("verificationUriComplete"), CopilotDeviceAuthState.VerificationUriComplete);
-	RootObject->SetObjectField(TEXT("auth"), AuthObject);
-
-	TSharedRef<FJsonObject> DraftObject = MakeShared<FJsonObject>();
-	DraftObject->SetStringField(TEXT("token"), DraftGitHubToken);
-	DraftObject->SetStringField(TEXT("model"), DraftModel.IsEmpty() ? DefaultCopilotModel : DraftModel);
-	DraftObject->SetStringField(TEXT("moduleName"), DraftModuleName.IsEmpty() ? DefaultModuleName : DraftModuleName);
-	DraftObject->SetStringField(TEXT("prompt"), DraftPrompt);
-	RootObject->SetObjectField(TEXT("draft"), DraftObject);
-
-	FString Output;
-	const TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
-		TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&Output);
-	FJsonSerializer::Serialize(RootObject, Writer);
-	return Output;
 }
 
-FString UGCAIHotReloadChatWidget::BuildHtmlDocument()
+void UGCAIHotReloadChatWidget::RefreshRuntimeLog()
 {
-	FString HtmlTemplate;
-	FString Stylesheet;
-	FString Script;
-	if (!LoadWebUiAsset(TEXT("index.html"), HtmlTemplate) ||
-		!LoadWebUiAsset(TEXT("styles.css"), Stylesheet) ||
-		!LoadWebUiAsset(TEXT("app.js"), Script))
-	{
-		return BuildMissingAssetDocument();
-	}
-
-	HtmlTemplate.ReplaceInline(HtmlCssPlaceholder, *Stylesheet, ESearchCase::CaseSensitive);
-	HtmlTemplate.ReplaceInline(HtmlJsPlaceholder, *Script, ESearchCase::CaseSensitive);
-	return HtmlTemplate;
-}
-
-void UGCAIHotReloadChatWidget::LoadBrowserDocument()
-{
-	if (!BrowserWidget.IsValid())
+	if (!RuntimeLogText.IsValid())
 	{
 		return;
 	}
 
-	const FString Document = BuildHtmlDocument();
-	BrowserWidget->LoadString(Document, TEXT("http://ugc.local/ai-hotfix/"));
+	if (RuntimeLines.Num() == 0)
+	{
+		RuntimeLogText->SetText(LOCTEXT("NoRuntime", "No runtime events yet."));
+		return;
+	}
+
+	const int32 Start = FMath::Max(0, RuntimeLines.Num() - 12);
+	TArray<FString> Recent;
+	for (int32 Index = Start; Index < RuntimeLines.Num(); ++Index)
+	{
+		Recent.Add(RuntimeLines[Index]);
+	}
+	RuntimeLogText->SetText(FText::FromString(FString::Join(Recent, TEXT("\n"))));
 }
 
-void UGCAIHotReloadChatWidget::HandleBrowserLoadCompleted()
+void UGCAIHotReloadChatWidget::SubmitPrompt()
 {
-	bBrowserReady = true;
-	PushBrowserState(true);
-}
-
-void UGCAIHotReloadChatWidget::UpdateDraftFields(
-	const FString& Token,
-	const FString& Model,
-	const FString& ModuleName,
-	const FString& Prompt)
-{
-	DraftGitHubToken = Token;
-	DraftModel = Model.IsEmpty() ? DefaultCopilotModel : Model;
-	DraftModuleName = ModuleName.IsEmpty() ? DefaultModuleName : ModuleName;
-	DraftPrompt = Prompt;
-}
-
-void UGCAIHotReloadChatWidget::HandleBrowserConsoleMessage(
-	const FString& Message,
-	const FString& Source,
-	int32 Line,
-	EWebBrowserConsoleLogSeverity Severity)
-{
-	(void)Source;
-	(void)Line;
-	(void)Severity;
-
-	if (!Message.StartsWith(BrowserCommandPrefix))
+	if (!PromptInput.IsValid())
 	{
 		return;
 	}
-}
 
-void UGCAIHotReloadChatWidget::UpdateDraft(
-	const FString& Token,
-	const FString& Model,
-	const FString& ModuleName,
-	const FString& Prompt)
-{
-	UpdateDraftFields(Token, Model, ModuleName, Prompt);
-}
-
-void UGCAIHotReloadChatWidget::Send(
-	const FString& Token,
-	const FString& Model,
-	const FString& ModuleName,
-	const FString& Prompt)
-{
-	UpdateDraftFields(Token, Model, ModuleName, Prompt);
+	const FString Prompt = PromptInput->GetText().ToString().TrimStartAndEnd();
+	if (Prompt.IsEmpty())
+	{
+		return;
+	}
 
 	UGCAIHotReloadSubsystem* Subsystem = GetHotReloadSubsystem();
 	if (!Subsystem)
@@ -322,54 +434,86 @@ void UGCAIHotReloadChatWidget::Send(
 		return;
 	}
 
-	bIsGenerating = true;
-	StatusMessage = TEXT("AI thinking...");
-
 	FGCAIProviderConfig Config = Subsystem->GetProviderConfig();
 	Config.bEnabled = true;
-	Config.ProviderId = TEXT("github-copilot");
-	Config.Transport = EGCAIProviderTransport::GitHubCopilot;
-	Config.Model = DraftModel.IsEmpty() ? DefaultCopilotModel : DraftModel;
-	if (!DraftGitHubToken.TrimStartAndEnd().IsEmpty())
+
+	// The panel targets an Anthropic Messages endpoint (cc-switch relay / Claude).
+	const FString BaseUrl = BaseUrlInput.IsValid() ? BaseUrlInput->GetText().ToString().TrimStartAndEnd() : FString();
+	if (!BaseUrl.IsEmpty())
 	{
-		Config.ApiKey = DraftGitHubToken;
+		Config.Transport = EGCAIProviderTransport::Anthropic;
+		Config.ProviderId = TEXT("anthropic");
+		Config.BaseUrl = BaseUrl;
 	}
-	Config.BaseUrl = TEXT("https://api.individual.githubcopilot.com");
-	Config.ChatCompletionsPath = TEXT("/v1/responses");
+
+	if (TokenInput.IsValid())
+	{
+		const FString Token = TokenInput->GetText().ToString().TrimStartAndEnd();
+		if (!Token.IsEmpty())
+		{
+			Config.ApiKey = Token;
+		}
+	}
+	if (ModelInput.IsValid())
+	{
+		const FString Model = ModelInput->GetText().ToString().TrimStartAndEnd();
+		if (!Model.IsEmpty())
+		{
+			Config.Model = Model;
+		}
+	}
 	Subsystem->ConfigureProvider(Config);
-	Subsystem->SendAgentPrompt(DraftPrompt, DraftModuleName);
-	SyncBrowserState(false);
+
+	bIsGenerating = true;
+	StatusMessage = TEXT("AI thinking...");
+	RefreshStatus();
+
+	Subsystem->SendAgentPrompt(Prompt, DraftModuleName);
+	PromptInput->SetText(FText::GetEmpty());
 }
 
-void UGCAIHotReloadChatWidget::Login(
-	const FString& Token,
-	const FString& Model,
-	const FString& ModuleName,
-	const FString& Prompt)
+FReply UGCAIHotReloadChatWidget::OnSendClicked()
 {
-	UpdateDraftFields(Token, Model, ModuleName, Prompt);
-
-	if (UGCAIHotReloadSubsystem* Subsystem = GetHotReloadSubsystem())
-	{
-		Subsystem->BeginCopilotDeviceLogin();
-	}
+	SubmitPrompt();
+	return FReply::Handled();
 }
 
-void UGCAIHotReloadChatWidget::Reload()
+FReply UGCAIHotReloadChatWidget::OnReloadClicked()
 {
 	if (UGCAIHotReloadSubsystem* Subsystem = GetHotReloadSubsystem())
 	{
-		const bool bAppliedPending = Subsystem->ApplyPendingHotfix();
-		if (!bAppliedPending)
+		if (!Subsystem->ApplyPendingHotfix())
 		{
 			Subsystem->RestartHotfixRuntime();
 		}
+	}
+	return FReply::Handled();
+}
+
+FReply UGCAIHotReloadChatWidget::OnResetClicked()
+{
+	if (UGCAIHotReloadSubsystem* Subsystem = GetHotReloadSubsystem())
+	{
+		Subsystem->ResetChatSession();
+	}
+	RuntimeLines.Reset();
+	RefreshMessages();
+	RefreshRuntimeLog();
+	return FReply::Handled();
+}
+
+void UGCAIHotReloadChatWidget::OnPromptCommitted(const FText& Text, ETextCommit::Type CommitType)
+{
+	// Multiline: Shift+Enter inserts a newline; a plain Enter commits as OnEnter.
+	if (CommitType == ETextCommit::OnEnter)
+	{
+		SubmitPrompt();
 	}
 }
 
 void UGCAIHotReloadChatWidget::HandleChatSessionChanged()
 {
-	if (UGCAIHotReloadSubsystem* Subsystem = GetHotReloadSubsystem())
+	if (const UGCAIHotReloadSubsystem* Subsystem = GetHotReloadSubsystem())
 	{
 		bIsGenerating = Subsystem->IsAgentTurnRunning();
 		if (!bIsGenerating && StatusMessage == TEXT("AI thinking..."))
@@ -378,13 +522,14 @@ void UGCAIHotReloadChatWidget::HandleChatSessionChanged()
 		}
 	}
 
-	SyncBrowserState(false);
+	RefreshMessages();
+	RefreshStatus();
 }
 
 void UGCAIHotReloadChatWidget::HandleRuntimeLog(const FString& Message)
 {
 	RuntimeLines.Add(TEXT("[runtime] ") + Message);
-	SyncBrowserState(false);
+	RefreshRuntimeLog();
 }
 
 void UGCAIHotReloadChatWidget::HandleHotfixApplied(const FString& Message)
@@ -392,7 +537,8 @@ void UGCAIHotReloadChatWidget::HandleHotfixApplied(const FString& Message)
 	bIsGenerating = false;
 	StatusMessage = TEXT("Hotfix live");
 	RuntimeLines.Add(TEXT("[apply] ") + Message);
-	SyncBrowserState(false);
+	RefreshStatus();
+	RefreshRuntimeLog();
 }
 
 void UGCAIHotReloadChatWidget::HandleHotfixFailed(const FString& Message)
@@ -400,28 +546,15 @@ void UGCAIHotReloadChatWidget::HandleHotfixFailed(const FString& Message)
 	bIsGenerating = false;
 	StatusMessage = TEXT("Error");
 	RuntimeLines.Add(TEXT("[error] ") + Message);
-	SyncBrowserState(false);
+	RefreshStatus();
+	RefreshRuntimeLog();
 }
 
 void UGCAIHotReloadChatWidget::HandleHotfixGenerated(const FGCAIHotfixGenerationResult& Result)
 {
 	bIsGenerating = false;
-	StatusMessage = Result.Summary.IsEmpty() ? TEXT("Code ready, press Reload") : Result.Summary;
-	SyncBrowserState(false);
+	StatusMessage = Result.Summary.IsEmpty() ? TEXT("Code ready") : Result.Summary;
+	RefreshStatus();
 }
 
-void UGCAIHotReloadChatWidget::HandleCopilotDeviceAuthUpdated(const FGCAICopilotDeviceAuthState& State)
-{
-	CopilotDeviceAuthState = State;
-
-	if (State.bIsAuthenticated)
-	{
-		StatusMessage = TEXT("Copilot ready");
-	}
-	else if (State.bIsPending)
-	{
-		StatusMessage = TEXT("Waiting for GitHub device approval");
-	}
-
-	SyncBrowserState(false);
-}
+#undef LOCTEXT_NAMESPACE

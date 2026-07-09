@@ -3,9 +3,9 @@
 UGCAIHotReloadSettings::UGCAIHotReloadSettings()
 {
 	DefaultProvider.bEnabled = true;
-	DefaultProvider.ProviderId = TEXT("github-copilot");
-	DefaultProvider.Transport = EGCAIProviderTransport::GitHubCopilot;
-	DefaultProvider.BaseUrl = TEXT("https://api.individual.githubcopilot.com");
-	DefaultProvider.ChatCompletionsPath = TEXT("/chat/completions");
-	DefaultProvider.Model = TEXT("gpt-4o");
+	DefaultProvider.ProviderId = TEXT("anthropic");
+	DefaultProvider.Transport = EGCAIProviderTransport::Anthropic;
+	DefaultProvider.BaseUrl = FString();
+	DefaultProvider.ChatCompletionsPath = TEXT("/v1/messages");
+	DefaultProvider.Model = TEXT("claude-opus-4-8");
 }

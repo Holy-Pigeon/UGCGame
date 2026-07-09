@@ -2,12 +2,19 @@
 
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"
+#include "Styling/SlateBrush.h"
 #include "GCAIHotReloadTypes.h"
 #include "GCAIHotReloadChatWidget.generated.h"
 
-enum class EWebBrowserConsoleLogSeverity;
-class SWebBrowser;
+class SButton;
+class SEditableTextBox;
+class SMultiLineEditableTextBox;
+class SScrollBox;
+class STextBlock;
+class UGCAIHotReloadSubsystem;
 
+// Native Slate chat panel for the in-game AI agent. Replaces the previous CEF
+// WebBrowser UI, which rendered unreliably in PIE.
 UCLASS()
 class UGCAIHotReloadChatWidget : public UUserWidget
 {
@@ -20,28 +27,17 @@ public:
 	virtual void ReleaseSlateResources(bool bReleaseChildren) override;
 
 private:
-	void RefreshFromSubsystem();
-	void SyncBrowserState(bool bHydrateInputs);
-	void PushBrowserState(bool bHydrateInputs);
-	class UGCAIHotReloadSubsystem* GetHotReloadSubsystem() const;
-	FString BuildPageStateJson(bool bHydrateInputs) const;
-	static FString BuildHtmlDocument();
-	void HandleBrowserLoadCompleted();
-	void HandleBrowserConsoleMessage(const FString& Message, const FString& Source, int32 Line, EWebBrowserConsoleLogSeverity Severity);
-	void LoadBrowserDocument();
-	void UpdateDraftFields(const FString& Token, const FString& Model, const FString& ModuleName, const FString& Prompt);
+	UGCAIHotReloadSubsystem* GetHotReloadSubsystem() const;
 
-	UFUNCTION()
-	void UpdateDraft(const FString& Token, const FString& Model, const FString& ModuleName, const FString& Prompt);
+	void RefreshMessages();
+	void RefreshStatus();
+	void RefreshRuntimeLog();
 
-	UFUNCTION()
-	void Send(const FString& Token, const FString& Model, const FString& ModuleName, const FString& Prompt);
-
-	UFUNCTION()
-	void Login(const FString& Token, const FString& Model, const FString& ModuleName, const FString& Prompt);
-
-	UFUNCTION()
-	void Reload();
+	void SubmitPrompt();
+	FReply OnSendClicked();
+	FReply OnReloadClicked();
+	FReply OnResetClicked();
+	void OnPromptCommitted(const FText& Text, ETextCommit::Type CommitType);
 
 	UFUNCTION()
 	void HandleChatSessionChanged();
@@ -58,17 +54,26 @@ private:
 	UFUNCTION()
 	void HandleHotfixGenerated(const FGCAIHotfixGenerationResult& Result);
 
-	UFUNCTION()
-	void HandleCopilotDeviceAuthUpdated(const FGCAICopilotDeviceAuthState& State);
+	TSharedRef<SWidget> BuildMessageEntry(const FGCAIChatMessage& Message) const;
 
-	TSharedPtr<SWebBrowser> BrowserWidget;
+	TSharedPtr<SScrollBox> MessageScrollBox;
+	TSharedPtr<SEditableTextBox> BaseUrlInput;
+	TSharedPtr<SEditableTextBox> TokenInput;
+	TSharedPtr<SEditableTextBox> ModelInput;
+	TSharedPtr<SMultiLineEditableTextBox> PromptInput;
+	TSharedPtr<STextBlock> StatusText;
+	TSharedPtr<STextBlock> AuthText;
+	TSharedPtr<STextBlock> RuntimeLogText;
+	TSharedPtr<SButton> SendButton;
+
+	FSlateBrush PanelBrush;
+	FSlateBrush HeaderBrush;
+	FSlateBrush UserBubbleBrush;
+	FSlateBrush AssistantBubbleBrush;
+	FSlateBrush ToolBubbleBrush;
+
 	TArray<FString> RuntimeLines;
-	FGCAICopilotDeviceAuthState CopilotDeviceAuthState;
 	FString StatusMessage = TEXT("Ready");
-	FString DraftGitHubToken;
-	FString DraftPrompt;
 	FString DraftModuleName = TEXT("AIHotfix/Generated/Current");
-	FString DraftModel = TEXT("gpt-5.2");
-	bool bBrowserReady = false;
 	bool bIsGenerating = false;
 };

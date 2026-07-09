@@ -10,6 +10,7 @@ public class UGCGame : ModuleRules
 	
 		PublicDependencyModuleNames.AddRange(new string[]
 		{
+			"AIModule",
 			"Core",
 			"CoreUObject",
 			"DeveloperSettings",
@@ -20,6 +21,7 @@ public class UGCGame : ModuleRules
 			"JsEnv",
 			"Json",
 			"JsonUtilities",
+			"NavigationSystem",
 			"Slate",
 			"SlateCore",
 			"UMG"

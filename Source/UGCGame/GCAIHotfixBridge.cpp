@@ -46,3 +46,25 @@ FString UGCAIHotfixBridge::GetActiveModuleName() const
 
 	return FString();
 }
+
+FString UGCAIHotfixBridge::GetHotfixModuleName() const
+{
+	if (const UGCAIHotReloadSubsystem* OwnerSubsystem = Owner.Get())
+	{
+		return OwnerSubsystem->GetBootHotfixModuleName();
+	}
+
+	return FString();
+}
+
+bool UGCAIHotfixBridge::ExecuteScript(const FString& Code, FString& OutResult) const
+{
+	if (!ScriptEvalHandler.IsBound())
+	{
+		OutResult = TEXT("JavaScript runtime is not ready (eval handler not bound).");
+		return false;
+	}
+
+	OutResult = ScriptEvalHandler.Execute(Code);
+	return true;
+}
